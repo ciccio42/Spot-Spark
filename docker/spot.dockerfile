@@ -4,6 +4,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt update && apt install -y \
     python3-pip \
+    git \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /opt
@@ -19,6 +20,14 @@ RUN pip3 install --no-cache-dir --upgrade pip \
     bosdyn-choreography-client==5.0.1 \
     bosdyn-api==5.0.1 \
     bosdyn-core==5.0.1
+
+RUN mkdir -p /home/spot_ws/src
+WORKDIR /home/spot_ws/src
+RUN git clone https://github.com/ciccio42/spot_ros2.git
+WORKDIR /home/spot_ws/src/spot_ros2
+RUN git submodule init && git submodule update && ./install_spot_ros2.sh --arm64
+WORKDIR /home/spot_ws
+RUN source /opt/ros/${ROS_DISTRO}/setup.bash && colcon build --symlink-install
 
 RUN echo "source /opt/ros/${ROS_DISTRO}/setup.bash" >> /root/.bashrc
 
