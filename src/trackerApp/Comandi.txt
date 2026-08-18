@@ -1,0 +1,34 @@
+#Comandi utili
+
+#Publicazione di msg/Twist per /cmd_vel a 10Hz
+ros2 topic pub -r 10 /cmd_vel geometry_msgs/msg/Twist "{linear : {x: 0.1, y: 0.0, z: 0.0}, angular:{z: 0.0}}"
+
+
+#Replay dei bags
+ros2 bag replay <nome_cartella>
+
+#Visualizzazione delle camere dei bags o anche di spot
+ros2 run rqt_image_view rqt_image_view
+
+#Run del Dector Node
+ros2 run detector_package detector_node
+
+
+#RUN tracking_fsm
+ros2 run demo_package tracking_fsm
+
+#numpy <2
+pip install --break-system-packages "numpy<2"
+
+
+#avviare i compressed
+ros2 run image_transport republish raw compressed \
+-r in:=/camera/hand/image \
+-r out:=/camera/hand/compressed
+
+
+# 1. Diretto (funziona sempre, bypassa la "scoperta" automatica del trasporto)
+ros2 run rqt_image_view rqt_image_view /person_follow/hand_debug/compressed
+
+# 2. Lasciando che rqt scopra da solo il trasporto: seleziona la BASE (senza /compressed)
+ros2 run rqt_image_view rqt_image_view /person_follow/hand_debug

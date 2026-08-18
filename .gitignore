@@ -1,1 +1,11 @@
 spot_ros2/
+bags/
+tmp/*
+*.log
+log/*
+src/trackerApp/spot/spot_sim_champ/*
+*.rc
+src/trackerApp/spot_bags_code/*
+*pyc
+*pt
+.DS_Store

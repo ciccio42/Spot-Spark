@@ -1,0 +1,15 @@
+# Richiesta di detection al DetectorNode (container yolo).
+#
+# Detection SEMPRE sull'immagine intera — nessuna ROI/crop qui: quella
+# logica (proiezione del cono, eventuale filtro sui risultati, disegno dei
+# bordi per il debug) vive in demo_package, non nel DetectorPackage.
+
+sensor_msgs/Image image
+
+# Se vuoto, il nodo usa le classi di default configurate (parametro ROS2
+# default_classes).
+string[] target_classes
+
+---
+
+BoxDetection[] detections
