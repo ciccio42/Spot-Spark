@@ -48,9 +48,15 @@ class DetectClient:
                 f"(il container yolo e' su? ROS_DOMAIN_ID combacia tra i due container?) — "
                 f"riprovera' alle prossime chiamate.")
 
-    def call_sync(self, image_msg, target_classes=None, timeout_sec=10.0):
+    def call_sync(self, image_msg, target_classes=None, timeout_sec=10.0, reset_tracker=False):
         """Chiamata BLOCCANTE: non ritorna finche' non arriva la risposta (o
         scade `timeout_sec`).
+
+        `reset_tracker=True`: chiede al DetectorNode di azzerare lo stato
+        interno del tracker (BoT-SORT) PRIMA di elaborare questa richiesta
+        — usalo quando tracking_fsm torna in SEARCH dopo aver perso il
+        target, cosi' un vecchio track_id non riemerga in una sessione
+        nuova.
 
         Ritorna la risposta (detector_interfaces.srv.Detect.Response, campo
         `detections`), oppure None se: il servizio non e' pronto, la
@@ -62,6 +68,7 @@ class DetectClient:
         request.image = image_msg
         if target_classes is not None:
             request.target_classes = list(target_classes)
+        request.reset_tracker = reset_tracker
 
         done_event = threading.Event()
         result = {}

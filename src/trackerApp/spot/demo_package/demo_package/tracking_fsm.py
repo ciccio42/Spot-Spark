@@ -2,34 +2,31 @@
 """
 tracking_fsm.py (demo_package)
 
-RISCRITTURA: design a CAMERA SINGOLA (solo braccio). front_localizer.py e
-le camere frontali non servono piu' — tutto (ROI, detection, distanza)
-avviene qui, su un'unica camera.
+DUE METODI COMPLETAMENTE SEPARATI, non intrecciati — scelti con UN SOLO
+switch in cima al file (TRACKING_METHOD). Non e' "quale similarita' uso
+nel recovery": sono due architetture diverse, ciascuna con la propria
+implementazione di SEARCH/TRACKING/RECOVERY, per poterle confrontare senza
+che una contamini l'altra.
 
-Stati: INIT -> WAITING_TRIGGER -> SEARCH -> TRACKING (per ora placeholder,
-non fa nulla — verra' riempito in un passo successivo).
+  "botsort_hsv": l'identita' del target si basa SOLO su BoT-SORT
+      (track_id persistente, model.track()) + istogramma HSV come rete di
+      sicurezza quando il track_id sparisce. Nessun embedding neurale
+      coinvolto, in nessuno stato.
 
-Flusso in SEARCH, ad ogni frame RGB della camera del braccio:
-  1. Calcola il rettangolo di crop corrispondente alla ROI (apertura FOV +
-     range + altezza, gli stessi parametri di common.py) proiettando gli
-     angoli del volume 3D sulla camera — SOLO geometria/TF, nessuna depth
-     ancora coinvolta qui.
-  2. Ritaglia l'immagine RGB su quel rettangolo (non manda piu' l'immagine
-     intera al servizio Detect: gli manda il crop).
-  3. Il servizio Detect gira SOLO sul crop — le detection tornano in
-     coordinate LOCALI al crop, le ritraduciamo in coordinate dell'immagine
-     intera prima di usarle altrove.
-  4. Per ogni box: legge la depth ToF della camera del braccio (riscalata
-     alla risoluzione della depth se diversa da quella RGB — tipico dei
-     sensori ToF) e verifica se la distanza e' nel raggio d'azione
-     definito (CONE_MIN_RANGE/CONE_MAX_RANGE).
-  5. Se c'e' ESATTAMENTE un box valido, e resta stabile (~stessa posizione)
-     per `stability_frames_required` frame consecutivi, il target viene
-     agganciato -> TRACKING.
+  "embedding_only": l'identita' si basa SOLO sull'embedding neurale
+      (modello di classificazione separato, vedi embedding_model_path lato
+      DetectorNode) — in TUTTI gli stati, SEARCH compreso. BoT-SORT/track_id
+      non vengono mai usati per decidere chi e' il target (anche se il
+      servizio li calcola comunque, semplicemente li ignoriamo).
 
-Il topic di debug e' visibile in TUTTI gli stati (anche INIT/WAITING_TRIGGER),
-non solo dopo l'avvio di SEARCH — cosi' puoi verificare a occhio la ROI e la
-detection prima ancora di premere invio.
+Design comune a entrambi i metodi (invariato):
+  - ROI come ritaglio dell'immagine (FOV via intrinseci, altezza da
+    frazioni fisse — nessuna TF).
+  - Distanza letta dalla depth ToF (patch centrata sul box).
+  - Chiamata al servizio Detect SINCRONA/bloccante, executor multi-thread
+    con gruppi di callback separati (client vs resto) per evitare deadlock.
+  - TRACKING -> periodo di tolleranza a FRAME -> RECOVERY (timeout a
+    TEMPO REALE) -> WAITING_TRIGGER se il target non si ritrova.
 """
 
 import math
@@ -49,7 +46,8 @@ from geometry_msgs.msg import PoseStamped
 from demo_package.common import (
     CameraIntrinsics, box_center, distance,
     extract_appearance_embedding, embedding_similarity,
-    compute_roi_crop_rect, scale_box_to_depth, box_center_depth,
+    embedding_from_msg, neural_embedding_similarity,
+    compute_roi_crop_rect, scale_box_to_depth, box_center_depth, rich_neural_embedding_similarity,
     CONE_FOV_DEG, CONE_MIN_RANGE, CONE_MAX_RANGE,
 )
 from demo_package.detect_client import DetectClient
@@ -58,6 +56,14 @@ INIT = "init"
 WAITING_TRIGGER = "waiting_trigger"
 SEARCH = "search"
 TRACKING = "tracking"
+RECOVERY = "recovery"
+
+# ============================================================
+# LO SWITCH — decide quale delle due architetture usare per l'intera
+# sessione. Cambia questo, ricompila, testa; per confrontare i due
+# metodi servono due sessioni separate, non uno switch a runtime.
+# ============================================================
+TRACKING_METHOD = "botsort_hsv"  # "botsort_hsv" oppure "embedding_only"
 
 # ============================================================
 # Valori scritti qui, nessun argomento da terminale.
@@ -73,12 +79,42 @@ TARGET_CLASSES = ['person']
 DEBUG_IMAGE_TOPIC = '/person_follow/hand_debug/compressed'  # suffisso /compressed: convenzione
                                                                # image_transport, stessa di /camera/hand/compressed
 
-REID_SIMILARITY_THRESHOLD = 0.5
+REID_SIMILARITY_THRESHOLD = 0.60  # alzata da 0.5 — mitigazione parziale, non risolve da sola i casi
+                                    # di similarita' altissima per coincidenza (es. oggetti fuori
+                                    # distribuzione per il modello di ReID, vedi MIN_DETECTION_CONFIDENCE)
+MIN_DETECTION_CONFIDENCE = 0.10    # confidenza MINIMA della detection di YOLOE stessa (non l'aspetto)
+                                    # per essere considerato un candidato — filtro indipendente
+                                    # dall'aspetto, scarta classificazioni "person" incerte/al limite
 REID_EMA_ALPHA = 0.3
-STABILITY_FRAMES_REQUIRED = 10    # frame consecutivi stabili prima di agganciare
-STABILITY_PX_TOLERANCE = 40.0
-LOST_FRAMES_THRESHOLD = 10        # frame consecutivi senza un box valido prima di tornare in SEARCH
+TARGET_DISTANCE_THRESHOLD_FRAC = 0.30  # quanto puo' spostarsi (in pixel, come frazione della
+                                         # diagonale immagine) il target da un frame all'altro —
+                                         # oltre questa soglia, anche un aspetto simile viene scartato.
+STABILITY_FRAMES_REQUIRED = 10    # frame consecutivi "stabili" (significato diverso nei due
+                                    # metodi — vedi i rispettivi _handle_search_response_*)
+                                    # prima di agganciare in SEARCH
+TRACKING_GRACE_FRAMES = 30        # in TRACKING: frame di tentativo prima di passare a RECOVERY
+RECOVERY_TIMEOUT_SEC = 15.0       # in RECOVERY: secondi di tempo REALE prima di arrendersi
+REACQUISITION_STABILITY_FRAMES = 3   # quante volte di fila lo STESSO candidato deve risultare il
+                                       # migliore match prima di essere CONFERMATO come il target
+                                       # ritrovato (in TRACKING o RECOVERY) — un solo frame fortunato
+                                       # (un'altra persona che per un istante somiglia e sta nel posto
+                                       # giusto) non basta piu' a rubare l'identita' del target.
+REACQUISITION_PX_TOLERANCE = 60.0    # quanto puo' spostarsi tra un tentativo e l'altro per essere
+                                       # considerato "lo stesso candidato in corso di conferma"
 STOPPING_DISTANCE = 1.0
+
+
+REID_COMBINE = 0.40  # margine di vantaggio minimo (sopra la soglia REID_SIMILARITY_THRESHOLD)
+
+W_SIMILARITY = 0.7
+W_POSITION = 0.3
+
+W_COSINE = 0.5
+W_EUCLIDEAN = 1.0
+W_MAGNITUDE = 0.8
+
+EUCLIDEAN_SCALE= 10.0
+MAGNITUDE_SCALE = 10.0
 
 
 class TrackingFSM(Node):
@@ -110,18 +146,28 @@ class TrackingFSM(Node):
         self.detect_client = DetectClient(self, DETECT_SERVICE, callback_group=self._service_group)
 
         self.state = INIT
-        self.reference_embedding = None
-        self.lost_frames = 0
+        self.reference_embedding = None  # HSV in botsort_hsv, vettore neurale in embedding_only
+                                           # — mai entrambi insieme, il TIPO dipende da TRACKING_METHOD
         self.last_target_base = None
         self.last_published_pos = None
         self.last_published_time = 0.0
-        self._stability_count = 0
-        self._stability_box_center = None
-        self._locked_box = None  # ultimo box agganciato, ridisegnato (statico) durante TRACKING
 
-        self._manual_trigger_received = False
-        self._stdin_thread = threading.Thread(target=self._wait_for_manual_trigger, daemon=True)
-        self._stdin_thread.start()
+        self._locked_box = None  # ultimo box confermato — usato da entrambi i metodi
+        self._locked_track_id = -1  # SOLO botsort_hsv: track_id del target agganciato
+
+        self._stability_count = 0
+        self._stability_track_id = -1              # SOLO botsort_hsv
+        self._stability_reference_embedding = None  # SOLO embedding_only (confronto col frame precedente)
+
+        self._tracking_miss_count = 0   # frame consecutivi di tentativo IN TRACKING, entrambi i metodi
+        self._recovery_deadline = None  # time.monotonic() oltre il quale RECOVERY si arrende
+        self._reacquisition_pending_box = None  # candidato in corso di conferma (vedi _confirm_reacquisition)
+        self._reacquisition_count = 0
+
+        self._pending_tracker_reset = False  # SOLO botsort_hsv: True = la PROSSIMA chiamata
+                                               # chiede anche l'azzeramento del tracker BoT-SORT
+
+        self._start_trigger_thread()
 
         self.create_subscription(CameraInfo, HAND_CAMERA_INFO_TOPIC, self._camera_info_cb,
                                   qos_profile_sensor_data, callback_group=self._main_group)
@@ -134,13 +180,56 @@ class TrackingFSM(Node):
 
         self.goal_pub = self.create_publisher(PoseStamped, GOAL_UPDATE_TOPIC, 5)
         self.debug_pub = self.create_publisher(CompressedImage, DEBUG_IMAGE_TOPIC, 5)
+        
 
         self.get_logger().info(
-            f"TrackingFSM avviato (design camera singola) — stato iniziale: INIT. "
+            f"TrackingFSM avviato — METODO ATTIVO: {TRACKING_METHOD}. Stato iniziale: INIT. "
             f"ROI: FOV={math.degrees(self.fov_rad):.0f}° (crop larghezza), "
             f"range=[{self.min_range:.2f},{self.max_range:.2f}]m (post-detection, via depth)")
 
     # ------------------------------------------------------------------
+    def _start_trigger_thread(self):
+        """Avvia (o riavvia) il thread che aspetta INVIO. Un thread Python
+        non e' riavviabile una volta terminato — per questo, ogni volta che
+        serve un nuovo trigger (il primo avvio, o il ritorno in
+        WAITING_TRIGGER da RECOVERY), se ne crea uno nuovo, non si riusa il
+        vecchio."""
+        self._manual_trigger_received = False
+        self._stdin_thread = threading.Thread(target=self._wait_for_manual_trigger, daemon=True)
+        self._stdin_thread.start()
+
+    def _enter_waiting_trigger(self):
+        """Torna in WAITING_TRIGGER — chiamato quando RECOVERY scade senza
+        ritrovare il target. Richiede di premere di nuovo INVIO: dopo un
+        fallimento cosi' prolungato, decidere se/quando riprovare torna a
+        essere una scelta della persona, non un ciclo automatico.
+
+        NON azzera self.reference_embedding — e' voluto: e' la "memoria" di
+        chi stavamo seguendo, e la vogliamo usare per filtrare la PROSSIMA
+        SEARCH (vedi il controllo d'aspetto in _handle_search_response_*),
+        cosi' un oggetto qualsiasi (es. un altro robot classificato per
+        errore come "person") non venga agganciato solo perche' e' l'unico
+        presente — deve anche somigliare a chi avevamo gia' imparato a
+        riconoscere. Alla primissima ricerca in assoluto (mai stato
+        agganciato nulla prima), reference_embedding e' ancora None: in
+        quel caso specifico SEARCH non ha nulla con cui filtrare, e accetta
+        il primo candidato stabile — limite di partenza inevitabile senza
+        un passo di registrazione esplicito."""
+        self.state = WAITING_TRIGGER
+        self._locked_box = None
+        self._locked_track_id = -1
+        self._stability_count = 0
+        self._stability_track_id = -1
+        self._stability_reference_embedding = None
+        self._tracking_miss_count = 0
+        self._recovery_deadline = None
+        self._reacquisition_pending_box = None
+        self._reacquisition_count = 0
+        self._pending_tracker_reset = True  # innocuo se TRACKING_METHOD="embedding_only"
+                                               # (il campo semplicemente non viene guardato lato yolo
+                                               # se use_tracker=False)
+        self._start_trigger_thread()
+
     def _wait_for_manual_trigger(self):
         try:
             input("\n>>> Premi INVIO in questo terminale per avviare SEARCH...\n")
@@ -157,10 +246,13 @@ class TrackingFSM(Node):
 
     def _depth_cb(self, depth_msg):
         self._latest_depth_image = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding='passthrough')
+        
+        
+        
 
     # ------------------------------------------------------------------
     # Dispatch per stato — il debug e' costruito e pubblicato SEMPRE
-    # (tutti gli stati), la detection gira SOLO in SEARCH.
+    # (tutti gli stati), la detection gira SOLO in SEARCH/TRACKING/RECOVERY.
     # ------------------------------------------------------------------
     def _image_cb(self, rgb_msg):
         t_start = time.monotonic()
@@ -187,8 +279,8 @@ class TrackingFSM(Node):
             if crop_rect is not None:
                 cv2.rectangle(debug_frame, (crop_rect[0], crop_rect[1]), (crop_rect[2], crop_rect[3]),
                               (0, 200, 255), 2)
-            cv2.putText(debug_frame, f"Stato: {self.state.upper()}", (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+            cv2.putText(debug_frame, f"[{TRACKING_METHOD}] {self.state.upper()}", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
         t_crop_draw = time.monotonic()
 
         self.get_logger().info(
@@ -204,9 +296,6 @@ class TrackingFSM(Node):
                     "in attesa del trigger manuale.")
                 self.state = WAITING_TRIGGER
             self._publish_debug(debug_frame, rgb_msg.header)
-            self.get_logger().info(
-                f"[timing image_cb] pubblicazione={(time.monotonic() - t_crop_draw) * 1000:.0f}ms",
-                throttle_duration_sec=1.0)
             return
 
         # ---- WAITING_TRIGGER: aspetta INVIO ----
@@ -215,16 +304,12 @@ class TrackingFSM(Node):
                 self.get_logger().info("Trigger manuale ricevuto — passo a SEARCH.")
                 self.state = SEARCH
             self._publish_debug(debug_frame, rgb_msg.header)
-            self.get_logger().info(
-                f"[timing image_cb] pubblicazione={(time.monotonic() - t_crop_draw) * 1000:.0f}ms",
-                throttle_duration_sec=1.0)
             return
 
-        # ---- TRACKING: stessa chiamata di SEARCH, ma la risposta viene gestita diversamente ----
-        # ---- SEARCH: qui gira davvero la detection, sul crop — CHIAMATA BLOCCANTE ----
+        # ---- SEARCH / TRACKING / RECOVERY: qui gira la detection, sul crop — CHIAMATA BLOCCANTE ----
         if crop_rect is None:
             self.get_logger().info(
-                f"{self.state.upper()}: ROI non calcolabile questo frame (TF non disponibile) — "
+                f"{self.state.upper()}: ROI non calcolabile questo frame (intrinseci non ancora pronti) — "
                 f"nessuna detection.", throttle_duration_sec=2.0)
             self._publish_debug(debug_frame, rgb_msg.header)
             return
@@ -234,24 +319,35 @@ class TrackingFSM(Node):
         crop_msg = self.bridge.cv2_to_imgmsg(crop_bgr, encoding='bgr8')
         crop_msg.header = rgb_msg.header
 
-        # BLOCCANTE: _image_cb non ritorna finche' non arriva la risposta.
-        # Durante l'attesa, camera_info/depth restano in coda (stesso gruppo
-        # di callback) — e' la scelta "blocchiamo tutto" che avevi chiesto.
-        response = self.detect_client.call_sync(crop_msg, target_classes=TARGET_CLASSES)
+        reset_now = self._pending_tracker_reset
+        self._pending_tracker_reset = False
+        response = self.detect_client.call_sync(crop_msg, target_classes=TARGET_CLASSES, reset_tracker=reset_now)
 
         try:
-            if self.state == SEARCH:
-                self._handle_search_response(response, frame_bgr, crop_rect, debug_frame, rgb_msg.header)
-            else:  # TRACKING
-                self._handle_track_response(response, frame_bgr, crop_rect, debug_frame, rgb_msg.header)
+            if TRACKING_METHOD == "botsort_hsv":
+                if self.state == SEARCH:
+                    self._handle_search_response_botsort(response, frame_bgr, crop_rect, debug_frame, rgb_msg.header)
+                elif self.state == TRACKING:
+                    self._handle_track_response_botsort(response, frame_bgr, crop_rect, debug_frame, rgb_msg.header)
+                else:  # RECOVERY
+                    self._handle_recovery_response_botsort(response, frame_bgr, crop_rect, debug_frame, rgb_msg.header)
+            else:  # embedding_only
+                if self.state == SEARCH:
+                    self._handle_search_response_embedding(response, frame_bgr, crop_rect, debug_frame, rgb_msg.header)
+                elif self.state == TRACKING:
+                    self._handle_track_response_embedding(response, frame_bgr, crop_rect, debug_frame, rgb_msg.header)
+                else:  # RECOVERY
+                    self._handle_recovery_response_embedding(response, frame_bgr, crop_rect, debug_frame, rgb_msg.header)
         except Exception as ex:
             self.get_logger().error(f"Eccezione nell'elaborazione della risposta: {ex}", throttle_duration_sec=2.0)
             self._publish_debug(debug_frame, rgb_msg.header)
 
-    # ------------------------------------------------------------------
-    # SEARCH
-    # ------------------------------------------------------------------
-    def _handle_search_response(self, response, frame_bgr, crop_rect, debug_frame, header):
+    # ====================================================================
+    # METODO "botsort_hsv" — identita' via track_id (BoT-SORT), HSV come
+    # rete di sicurezza SOLO quando il track_id sparisce.
+    # ====================================================================
+
+    def _handle_search_response_botsort(self, response, frame_bgr, crop_rect, debug_frame, header):
         if response is None:
             self._publish_debug(debug_frame, header)
             return
@@ -259,172 +355,667 @@ class TrackingFSM(Node):
         crop_x1, crop_y1, _, _ = crop_rect
         depth_image = self._latest_depth_image
 
-        valid_boxes = []  # (box_in_full_image_coords, dist)
+        valid_boxes = []  # (box_full, dist, track_id)
         for det in response.detections:
-            # le coordinate tornano relative al CROP: le ritraduciamo nell'immagine intera
             box_full = (det.x1 + crop_x1, det.y1 + crop_y1, det.x2 + crop_x1, det.y2 + crop_y1)
+            self._draw_box(debug_frame, box_full, (100, 100, 100), f"{det.class_name} det pre CONFIDENCE check YOLOE SEARCH id {det.track_id}", label_offset=3)
+            
+            if det.score < MIN_DETECTION_CONFIDENCE:
+                if debug_frame is not None:
+                    self._draw_box(debug_frame, box_full, (128, 0, 128),
+                                    f"{det.class_name} (confidenza {det.score:.2f} troppo bassa)", label_offset=2)
+                continue
 
             if depth_image is None:
                 if debug_frame is not None:
-                    self._draw_box(debug_frame, box_full, (0, 255, 255), f"{det.class_name} (depth n/d)")
+                    self._draw_box(debug_frame, box_full, (0, 255, 255), f"{det.class_name} (depth n/d)", label_offset=2)
                 continue
-
             box_depth = scale_box_to_depth(box_full, frame_bgr.shape, depth_image.shape)
             dist = box_center_depth(depth_image, box_depth)
             if dist is None:
                 if debug_frame is not None:
-                    self._draw_box(debug_frame, box_full, (128, 128, 128), f"{det.class_name} (depth invalida)")
+                    self._draw_box(debug_frame, box_full, (128, 128, 128), f"{det.class_name} (depth invalida)", label_offset=2)
                 continue
-
-            in_range = self.min_range <= dist <= self.max_range
-            if not in_range:
+            if not (self.min_range <= dist <= self.max_range):
                 if debug_frame is not None:
-                    self._draw_box(debug_frame, box_full, (0, 0, 220), f"{det.class_name} {dist:.2f}m (fuori range)")
+                    self._draw_box(debug_frame, box_full, (0, 0, 220), f"{det.class_name} {dist:.2f}m (fuori range)", label_offset=2)
                 continue
 
-            # NIENTE disegno qui: lo facciamo una volta sola piu' avanti, con
-            # l'etichetta finale gia' completa (distanza + stato di stabilita'
-            # o TARGET) — disegnarlo anche qui e poi di nuovo dopo avrebbe
-            # sovrapposto due scritte nello stesso punto.
-            valid_boxes.append((box_full, dist))
+            # Se conosciamo gia' l'aspetto del target (da una sessione
+            # precedente in questo stesso avvio del nodo — vedi la nota in
+            # _enter_waiting_trigger), un candidato che non gli somiglia
+            # NON diventa un box valido, anche se e' l'unico presente e
+            # classificato "person". Alla primissima ricerca in assoluto
+            # (reference_embedding ancora None) questo filtro non si applica.
+            if self.reference_embedding is not None:
+                candidate_hsv = extract_appearance_embedding(frame_bgr, box_full)
+                sim = embedding_similarity(candidate_hsv, self.reference_embedding)
+                if sim < REID_SIMILARITY_THRESHOLD:
+                    if debug_frame is not None:
+                        self._draw_box(debug_frame, box_full, (255, 0, 255),
+                                        f"{det.class_name} {dist:.2f}m (non e' il target noto, sim={sim:.2f})", label_offset=2)
+                    continue
+
+            valid_boxes.append((box_full, dist, det.track_id, det.score))
 
         if len(valid_boxes) != 1:
             if debug_frame is not None:
-                for box_full, dist in valid_boxes:
-                    self._draw_box(debug_frame, box_full, (0, 200, 0), f"person {dist:.2f}m")
+                for box_full, dist, _track_id, score in valid_boxes:
+                    self._draw_box(debug_frame, box_full, (0, 200, 0), f"person {dist:.2f}m score={score:.2f}", label_offset=2)
             self.get_logger().info(
-                f"SEARCH in attesa: {len(valid_boxes)} box nel raggio d'azione su {len(response.detections)} "
-                f"rilevati nel crop (serve esattamente 1).", throttle_duration_sec=2.0)
+                f"SEARCH [botsort_hsv] in attesa: {len(valid_boxes)} box nel raggio d'azione su "
+                f"{len(response.detections)} rilevati (serve esattamente 1).", throttle_duration_sec=2.0)
             self._stability_count = 0
-            self._stability_box_center = None
+            self._stability_track_id = -1
             self._publish_debug(debug_frame, header)
             return
 
-        box_full, dist = valid_boxes[0]
-        box_center_now = box_center(box_full)
+        box_full, dist, track_id, score = valid_boxes[0]
 
-        if (self._stability_box_center is not None
-                and distance(box_center_now, self._stability_box_center) <= STABILITY_PX_TOLERANCE):
+        # Stabilita' basata SOLO sul track_id di BoT-SORT — se resta lo
+        # stesso numero per N frame di fila, ci fidiamo. track_id=-1 (non
+        # ancora agganciato da BoT-SORT) azzera il contatore: nessun segnale
+        # affidabile su cui confermare continuita'.
+        if track_id != -1 and track_id == self._stability_track_id:
             self._stability_count += 1
-        else:
+        elif track_id != -1:
             self._stability_count = 1
-        self._stability_box_center = box_center_now
+            self._stability_track_id = track_id
+        else:
+            self._stability_count = 0
+            self._stability_track_id = -1
 
         self.get_logger().info(
-            f"SEARCH: 1 box nel raggio d'azione a {dist:.2f}m — "
-            f"stabilita' {self._stability_count}/{STABILITY_FRAMES_REQUIRED}",
+            f"SEARCH [botsort_hsv]: 1 box nel raggio a {dist:.2f}m (track_id={track_id}, score={score:.2f}) — "
+            f"stabilita' {self._stability_count}/{STABILITY_FRAMES_REQUIRED}", throttle_duration_sec=1.0)
+
+        if self._stability_count < STABILITY_FRAMES_REQUIRED:
+            if debug_frame is not None:
+                label = (f"person {dist:.2f}m score={score:.2f} ({self._stability_count}/{STABILITY_FRAMES_REQUIRED})"
+                         if track_id != -1 else f"person {dist:.2f}m score={score:.2f} (non ancora tracciato da BoT-SORT) id={track_id}")
+                self._draw_box(debug_frame, box_full, (0, 200, 0), label, label_offset=0)
+            self._publish_debug(debug_frame, header)
+            return
+
+        # Stabile per abbastanza frame (secondo BoT-SORT): aggancio.
+        # Il riferimento HSV si calcola in locale, ORA, una volta sola.
+        self.reference_embedding = extract_appearance_embedding(frame_bgr, box_full)
+        self._locked_box = box_full
+        self._locked_track_id = track_id
+        self.state = TRACKING
+        self._stability_count = 0
+        self._stability_track_id = -1
+        self.get_logger().info(
+            f"[botsort_hsv] Target agganciato a {dist:.2f}m (track_id={track_id}) — passo a TRACKING.")
+        if debug_frame is not None:
+            self._draw_box(debug_frame, box_full, (0, 255, 0), f"TARGET {dist:.2f}m id={track_id}" , label_offset=0)
+        self._publish_debug(debug_frame, header)
+
+    def _attempt_reacquisition_botsort(self, response, frame_bgr, crop_rect, depth_image, debug_frame):
+        """SOLO istogramma HSV (mai neurale) — usata dal periodo di
+        tolleranza in TRACKING e da RECOVERY, quando il track_id agganciato
+        e' sparito dalle detection."""
+        if response is None:
+            return None, -1, None, None
+
+        crop_x1, crop_y1, _, _ = crop_rect
+        h_img, w_img = frame_bgr.shape[:2]
+        target_threshold_px = TARGET_DISTANCE_THRESHOLD_FRAC * math.hypot(w_img, h_img)
+        last_center = box_center(self._locked_box)
+
+        best_box, best_combined = None, -float("inf")
+        best_dist_m, best_score, best_track_id = None, None, -1
+
+        for det in response.detections:
+            box_full = (det.x1 + crop_x1, det.y1 + crop_y1, det.x2 + crop_x1, det.y2 + crop_y1)
+            self._draw_box(debug_frame, box_full, (200, 100, 100), f"{det.class_name} det pre_CONFIDENCE BOTSORT_TRACKING/RECOVERY id {det.track_id}" , label_offset=3)
+
+            if det.score < MIN_DETECTION_CONFIDENCE:
+                continue
+            if depth_image is None:
+                continue
+            box_depth = scale_box_to_depth(box_full, frame_bgr.shape, depth_image.shape)
+            dist_m = box_center_depth(depth_image, box_depth)
+            if dist_m is None or not (self.min_range <= dist_m <= self.max_range):
+                continue
+
+            hsv_embedding = extract_appearance_embedding(frame_bgr, box_full)
+            similarity = (1.0 if self.reference_embedding is None
+                          else embedding_similarity(hsv_embedding, self.reference_embedding))
+            if similarity < REID_SIMILARITY_THRESHOLD:
+                continue
+
+            dist_px = distance(box_center(box_full), last_center)
+            if dist_px > target_threshold_px:
+                continue
+
+            combined = (W_SIMILARITY * similarity) - (W_POSITION * ( dist_px / target_threshold_px))
+            if combined > best_combined:
+                best_combined = combined
+                best_box, best_dist_m, best_score, best_track_id = box_full, dist_m, similarity, det.track_id
+
+        return best_box, best_track_id, best_dist_m, best_score
+
+    def _handle_track_response_botsort(self, response, frame_bgr, crop_rect, debug_frame, header):
+        depth_image = self._latest_depth_image
+        
+        for det in response.detections:
+            box_full = (det.x1 + crop_rect[0], det.y1 + crop_rect[1],
+                        det.x2 + crop_rect[0], det.y2 + crop_rect[1])
+            self._draw_box(debug_frame, box_full, (100, 100, 100), f"{det.class_name} det pre CONFIDENCE check BOTSORT_TRACKING id {det.track_id}", label_offset=3)
+
+        # ---- PERCORSO VELOCE: il track_id agganciato e' ancora tra le detection? ----
+        fast_det = None
+        if response is not None and self._locked_track_id != -1:
+            crop_x1, crop_y1, _, _ = crop_rect
+            for det in response.detections:
+                if det.track_id == self._locked_track_id:
+                    fast_det = det
+                    break
+
+        if fast_det is not None:
+            box_full = (fast_det.x1 + crop_x1, fast_det.y1 + crop_y1,
+                        fast_det.x2 + crop_x1, fast_det.y2 + crop_y1)
+            dist_m = None
+            if depth_image is not None:
+                box_depth = scale_box_to_depth(box_full, frame_bgr.shape, depth_image.shape)
+                dist_m = box_center_depth(depth_image, box_depth)
+            in_range = dist_m is not None and (self.min_range <= dist_m <= self.max_range)
+
+            self._locked_box = box_full
+            self._tracking_miss_count = 0
+            self._reset_reacquisition_confirmation()  # sul percorso veloce, nessuna conferma pendente ha senso
+
+            if in_range:
+                new_hsv = extract_appearance_embedding(frame_bgr, box_full)
+                if new_hsv is not None and self.reference_embedding is not None:
+                    self.reference_embedding = (
+                        (1 - REID_EMA_ALPHA) * self.reference_embedding + REID_EMA_ALPHA * new_hsv)
+                if debug_frame is not None:
+                    # self._draw_box(debug_frame, box_full, (0, 255, 0),
+                    #                 f"TARGET {dist_m:.2f}m id={self._locked_track_id}", label_offset=0)
+                    pass
+                self.get_logger().info(
+                    f"TRACKING [botsort_hsv] ok (track_id={self._locked_track_id}): confermato a {dist_m:.2f}m",
+                    throttle_duration_sec=1.0)
+            else:
+                # Fuori range ma il track_id e' ancora quello giusto: NON lo
+                # contiamo come perso — restiamo agganciati, aspettiamo che rientri.
+                if debug_frame is not None:
+                    suffix = "(fuori range)" if dist_m is not None else "(depth n/d)"
+                    # self._draw_box(debug_frame, box_full, (0, 200, 255),
+                    #                 f"TARGET id={self._locked_track_id} {suffix}", label_offset=1)
+                self.get_logger().info(
+                    f"TRACKING [botsort_hsv]: track_id={self._locked_track_id} presente ma fuori range "
+                    f"— resto agganciato, non conto come perso.", throttle_duration_sec=1.0)
+
+            self._publish_debug(debug_frame, header)
+            return
+
+        # ---- Il track_id agganciato NON c'e': tentativo con HSV, ancora in TRACKING ----
+        # Un candidato trovato NON viene adottato subito — deve essere il
+        # migliore match per REACQUISITION_STABILITY_FRAMES tentativi di
+        # fila (vedi _confirm_reacquisition): un solo frame fortunato (es.
+        # un'altra persona che per un istante somiglia e sta nel posto
+        # giusto) non deve poter rubare l'identita' del target.
+        best_box, best_track_id, best_dist_m, best_score = self._attempt_reacquisition_botsort(
+            response, frame_bgr, crop_rect, depth_image, debug_frame)
+        
+        if best_box is not None and best_score < REID_COMBINE:
+            best_box = None  # scarta il candidato se la somiglianza e' troppo vicina alla soglia minima
+            
+
+        committed = False
+        if best_box is not None:
+            if self._confirm_reacquisition(best_box):
+                committed = True
+            else:
+                if debug_frame is not None:
+                    self._draw_box(debug_frame, best_box, (255, 165, 0),
+                                    f"possibile target {best_dist_m:.2f}m "
+                                    f"(conferma {self._reacquisition_count}/{REACQUISITION_STABILITY_FRAMES})" , label_offset=2)
+                self.get_logger().info(
+                    f"TRACKING [botsort_hsv]: candidato trovato, in attesa di conferma "
+                    f"({self._reacquisition_count}/{REACQUISITION_STABILITY_FRAMES})...", throttle_duration_sec=1.0)
+        else:
+            self._reset_reacquisition_confirmation()
+
+        if committed:
+            if debug_frame is not None:
+                self._draw_box(debug_frame, best_box, (0, 255, 0), f"TARGET {best_dist_m:.2f}m id={best_track_id}", label_offset=0)
+            old_track_id = self._locked_track_id
+            self._locked_box = best_box
+            self._locked_track_id = best_track_id  # ADOTTIAMO il nuovo track_id
+            self._tracking_miss_count = 0
+            new_hsv = extract_appearance_embedding(frame_bgr, best_box)
+            if new_hsv is not None and self.reference_embedding is not None:
+                self.reference_embedding = (
+                    (1 - REID_EMA_ALPHA) * self.reference_embedding + REID_EMA_ALPHA * new_hsv)
+            self.get_logger().info(
+                f"TRACKING [botsort_hsv]: target CONFERMATO a {best_dist_m:.2f}m, similarity={best_score:.2f} — "
+                f"track_id {old_track_id} -> {best_track_id}", throttle_duration_sec=1.0)
+            self._publish_debug(debug_frame, header)
+            return
+
+        # Nessuna corrispondenza confermata questo frame: avanza il
+        # contatore di tolleranza — sia che non ci fosse nessun candidato,
+        # sia che ce ne fosse uno ancora in attesa di conferma.
+        self._tracking_miss_count += 1
+        if self._tracking_miss_count < TRACKING_GRACE_FRAMES:
+            self.get_logger().info(
+                f"TRACKING [botsort_hsv]: target non trovato — tentativo "
+                f"{self._tracking_miss_count}/{TRACKING_GRACE_FRAMES} prima di passare a RECOVERY.",
+                throttle_duration_sec=1.0)
+            self._publish_debug(debug_frame, header)
+            return
+
+        self.state = RECOVERY
+        self._recovery_deadline = time.monotonic() + RECOVERY_TIMEOUT_SEC
+        self._tracking_miss_count = 0
+        self.get_logger().info(
+            f"TRACKING [botsort_hsv]: target non ritrovato entro {TRACKING_GRACE_FRAMES} frame — "
+            f"passo a RECOVERY (timeout {RECOVERY_TIMEOUT_SEC:.0f}s).")
+        self._publish_debug(debug_frame, header)
+
+    def _handle_recovery_response_botsort(self, response, frame_bgr, crop_rect, debug_frame, header):
+        depth_image = self._latest_depth_image
+        best_box, best_track_id, best_dist_m, best_score = self._attempt_reacquisition_botsort(
+            response, frame_bgr, crop_rect, depth_image, debug_frame)
+        
+        if best_box is not None and best_score < REID_COMBINE:
+            best_box = None  # scarta il candidato se la somiglianza e' troppo vicina alla soglia minima
+
+        committed = False
+        if best_box is not None:
+            if self._confirm_reacquisition(best_box):
+                committed = True
+            else:
+                if debug_frame is not None:
+                    self._draw_box(debug_frame, best_box, (255, 165, 0),
+                                    f"possibile target {best_dist_m:.2f}m "
+                                    f"(conferma {self._reacquisition_count}/{REACQUISITION_STABILITY_FRAMES})", label_offset=2)
+        else:
+            self._reset_reacquisition_confirmation()
+
+        if committed:
+            if debug_frame is not None:
+                self._draw_box(debug_frame, best_box, (0, 255, 0), f"TARGET {best_dist_m:.2f}m id={best_track_id}", label_offset=0)
+            old_track_id = self._locked_track_id
+            self._locked_box = best_box
+            self._locked_track_id = best_track_id
+            self.state = TRACKING
+            self._tracking_miss_count = 0
+            self._recovery_deadline = None
+            new_hsv = extract_appearance_embedding(frame_bgr, best_box)
+            if new_hsv is not None and self.reference_embedding is not None:
+                self.reference_embedding = (
+                    (1 - REID_EMA_ALPHA) * self.reference_embedding + REID_EMA_ALPHA * new_hsv)
+            self.get_logger().info(
+                f"RECOVERY [botsort_hsv]: target CONFERMATO a {best_dist_m:.2f}m, similarity={best_score:.2f} — "
+                f"track_id {old_track_id} -> {best_track_id} — torno a TRACKING.")
+            self._publish_debug(debug_frame, header)
+            return
+
+        remaining = self._recovery_deadline - time.monotonic()
+        if remaining <= 0:
+            self.get_logger().info(
+                f"RECOVERY [botsort_hsv]: timeout di {RECOVERY_TIMEOUT_SEC:.0f}s scaduto — "
+                f"torno in WAITING_TRIGGER.")
+            self._enter_waiting_trigger()
+        else:
+            self.get_logger().info(
+                f"RECOVERY [botsort_hsv]: nessuna corrispondenza confermata — {remaining:.0f}s rimanenti.",
+                throttle_duration_sec=1.0)
+        self._publish_debug(debug_frame, header)
+
+    # ====================================================================
+    # METODO "embedding_only" — identita' SOLO via embedding neurale, in
+    # OGNI stato (SEARCH compreso). Nessun track_id/BoT-SORT coinvolto.
+    # ====================================================================
+
+    def _handle_search_response_embedding(self, response, frame_bgr, crop_rect, debug_frame, header):
+        if response is None:
+            self._publish_debug(debug_frame, header)
+            return
+
+        crop_x1, crop_y1, _, _ = crop_rect
+        depth_image = self._latest_depth_image
+
+        valid_boxes = []  # (box_full, dist, embedding)
+        for det in response.detections:
+            box_full = (det.x1 + crop_x1, det.y1 + crop_y1, det.x2 + crop_x1, det.y2 + crop_y1)
+            self._draw_box(debug_frame, box_full, (100, 100, 100), f"{det.class_name} det pre MIN_DETECTION_CONFIDENCE check EMBEDDING_ONLY SEARCH", label_offset=3)
+
+            if det.score < MIN_DETECTION_CONFIDENCE:
+                continue
+            if depth_image is None:
+                if debug_frame is not None:
+                    self._draw_box(debug_frame, box_full, (0, 255, 255), f"{det.class_name} (depth n/d)", label_offset=0)
+                continue
+            box_depth = scale_box_to_depth(box_full, frame_bgr.shape, depth_image.shape)
+            dist = box_center_depth(depth_image, box_depth)
+            if dist is None:
+                if debug_frame is not None:
+                    self._draw_box(debug_frame, box_full, (128, 128, 128), f"{det.class_name} (depth invalida)", label_offset=0)
+                continue
+            if not (self.min_range <= dist <= self.max_range):
+                if debug_frame is not None:
+                    self._draw_box(debug_frame, box_full, (0, 0, 220), f"{det.class_name} {dist:.2f}m (fuori range)", label_offset=0   )
+                continue
+
+            candidate_embedding = embedding_from_msg(det.embedding)
+            self._draw_box(debug_frame, box_full, (0, 255, 0), f"{det.class_name} {dist:.2f}m (embedding: {candidate_embedding[:5]})", label_offset=1)
+            
+
+            # Stesso filtro del metodo botsort_hsv (vedi la nota gemella
+            # li'), qui con l'embedding neurale invece dell'HSV — se
+            # conosciamo gia' l'aspetto del target da una sessione
+            # precedente, un candidato che non gli somiglia non diventa un
+            # box valido.
+            if self.reference_embedding is not None:
+                
+                sim = rich_neural_embedding_similarity(candidate_embedding, self.reference_embedding , w_cosine=W_COSINE, w_euclidean=W_EUCLIDEAN, w_magnitude=W_MAGNITUDE, euclidean_scale=EUCLIDEAN_SCALE, magnitude_scale=MAGNITUDE_SCALE)
+                
+                if sim < REID_SIMILARITY_THRESHOLD:
+                    if debug_frame is not None:
+                        self._draw_box(debug_frame, box_full, (255, 0, 255),
+                                        f"{det.class_name} {dist:.2f}m (non e' il target noto, sim={sim:.2f})", label_offset=1)
+                    continue
+
+            valid_boxes.append((box_full, dist, candidate_embedding, det.score))
+        
+        if len(valid_boxes) != 1:
+            if debug_frame is not None:
+                for box_full, dist, _emb, score in valid_boxes:
+                    self._draw_box(debug_frame, box_full, (0, 200, 0), f"person {dist:.2f}m score={score:.2f}", label_offset=1)
+            self.get_logger().info(
+                f"SEARCH [embedding_only] in attesa: {len(valid_boxes)} box nel raggio d'azione su "
+                f"{len(response.detections)} rilevati (serve esattamente 1).", throttle_duration_sec=2.0)
+            self._stability_count = 0
+            self._stability_reference_embedding = None
+            self._publish_debug(debug_frame, header)
+            return
+
+        box_full, dist, box_embedding, score = valid_boxes[0]
+
+        if box_embedding is None:
+            self.get_logger().warn(
+                "SEARCH [embedding_only]: nessun embedding ricevuto — il DetectorNode ha "
+                "embedding_model_path configurato? Senza embedding non posso confermare stabilita' "
+                "in questo metodo.", throttle_duration_sec=2.0)
+            self._stability_count = 0
+            self._stability_reference_embedding = None
+            self._publish_debug(debug_frame, header)
+            return
+
+        # Stabilita' basata sulla continuita' D'ASPETTO frame-su-frame — non
+        # su un track_id (che qui non usiamo mai): l'embedding di questo box
+        # deve restare simile a quello del frame PRECEDENTE per N frame di fila.
+        if self._stability_reference_embedding is not None:
+            sim = neural_embedding_similarity(box_embedding, self._stability_reference_embedding)
+            if sim >= REID_SIMILARITY_THRESHOLD:
+                self._stability_count += 1
+            else:
+                self._stability_count = 1
+        else:
+            self._stability_count = 1
+        self._stability_reference_embedding = box_embedding  # confronto SEMPRE col frame appena visto
+
+        self.get_logger().info(
+            f"SEARCH [embedding_only]: 1 box nel raggio a {dist:.2f}m (score={score:.2f}) — "
+            f"stabilita' d'aspetto {self._stability_count}/{STABILITY_FRAMES_REQUIRED}",
             throttle_duration_sec=1.0)
 
         if self._stability_count < STABILITY_FRAMES_REQUIRED:
             if debug_frame is not None:
                 self._draw_box(debug_frame, box_full, (0, 200, 0),
-                                f"person {dist:.2f}m ({self._stability_count}/{STABILITY_FRAMES_REQUIRED})")
+                                f"person {dist:.2f}m score={score:.2f} ({self._stability_count}/{STABILITY_FRAMES_REQUIRED})", label_offset=1)
             self._publish_debug(debug_frame, header)
             return
 
         # Stabile per abbastanza frame: aggancio.
-        self.reference_embedding = extract_appearance_embedding(frame_bgr, box_full)
+        self.reference_embedding = box_embedding
         self._locked_box = box_full
         self.state = TRACKING
-        self.lost_frames = 0
         self._stability_count = 0
-        self._stability_box_center = None
-        self.get_logger().info(f"Target agganciato a {dist:.2f}m (box={box_full}) — passo a TRACKING.")
+        self._stability_reference_embedding = None
+        self.get_logger().info(f"[embedding_only] Target agganciato a {dist:.2f}m — passo a TRACKING.")
         if debug_frame is not None:
-            self._draw_box(debug_frame, box_full, (0, 255, 0), f"TARGET {dist:.2f}m")
+            self._draw_box(debug_frame, box_full, (0, 255, 0), f"TARGET {dist:.2f}m", label_offset=0)
         self._publish_debug(debug_frame, header)
 
-    # ------------------------------------------------------------------
-    # TRACKING
-    # ------------------------------------------------------------------
-    def _handle_track_response(self, response, frame_bgr, crop_rect, debug_frame, header):
+    def _attempt_reacquisition_embedding(self, response, frame_bgr, crop_rect, depth_image, debug_frame):
+        """SOLO embedding neurale (mai HSV, mai track_id) — chiamata ad
+        OGNI frame in TRACKING (qui non esiste un 'percorso veloce' via
+        track_id: ogni frame e' gia' un tentativo di riconoscimento pieno)
+        e in RECOVERY."""
         if response is None:
-            self._register_lost_frame(debug_frame, header)
-            return
+            return None, None, None, None
 
         crop_x1, crop_y1, _, _ = crop_rect
-        depth_image = self._latest_depth_image
+        h_img, w_img = frame_bgr.shape[:2]
+        target_threshold_px = TARGET_DISTANCE_THRESHOLD_FRAC * math.hypot(w_img, h_img)
+        last_center = box_center(self._locked_box)
 
-        best_box, best_score, best_dist = None, -float("inf"), None
-        candidates = []  # (box_full, dist, similarity) — solo quelli che passano entrambi i filtri
+        best_box, best_combined = None, -float("inf")
+        best_dist_m, best_score, best_embedding = None, None, None
 
         for det in response.detections:
             box_full = (det.x1 + crop_x1, det.y1 + crop_y1, det.x2 + crop_x1, det.y2 + crop_y1)
 
+            if det.score < MIN_DETECTION_CONFIDENCE:
+                continue
             if depth_image is None:
-                if debug_frame is not None:
-                    self._draw_box(debug_frame, box_full, (0, 255, 255), f"{det.class_name} (depth n/d)")
                 continue
             box_depth = scale_box_to_depth(box_full, frame_bgr.shape, depth_image.shape)
-            dist = box_center_depth(depth_image, box_depth)
-            if dist is None or not (self.min_range <= dist <= self.max_range):
-                if debug_frame is not None:
-                    self._draw_box(debug_frame, box_full, (0, 165, 255), f"{det.class_name} (fuori range)")
+            dist_m = box_center_depth(depth_image, box_depth)
+            if dist_m is None or not (self.min_range <= dist_m <= self.max_range):
                 continue
 
-            b_embedding = extract_appearance_embedding(frame_bgr, box_full)
-            similarity = (1.0 if self.reference_embedding is None
-                          else embedding_similarity(b_embedding, self.reference_embedding))
+            b_embedding = embedding_from_msg(det.embedding)
+            
+            # self._draw_box(debug_frame, box_full, (100, 100, 100), f"")
+            
+            similarity = rich_neural_embedding_similarity(b_embedding, self.reference_embedding, w_cosine=W_COSINE, w_euclidean=W_EUCLIDEAN, w_magnitude=W_MAGNITUDE, euclidean_scale=EUCLIDEAN_SCALE, magnitude_scale=MAGNITUDE_SCALE)
+                          
             if similarity < REID_SIMILARITY_THRESHOLD:
-                if debug_frame is not None:
-                    self._draw_box(debug_frame, box_full, (0, 0, 220),
-                                    f"{det.class_name} {dist:.2f}m (aspetto {similarity:.2f})")
                 continue
 
-            # NIENTE disegno qui: lo facciamo una volta sola dopo, cosi' il
-            # migliore prende l'etichetta TARGET senza sovrapporsi a un'altra
-            # scritta gia' disegnata nello stesso punto.
-            candidates.append((box_full, dist, similarity))
-            if similarity > best_score:
-                best_score, best_box, best_dist = similarity, box_full, dist
+            dist_px = distance(box_center(box_full), last_center)
+            if dist_px > target_threshold_px:
+                continue
 
-        if debug_frame is not None:
-            for box_full, dist, similarity in candidates:
-                if box_full == best_box:
-                    label = f"TARGET {dist:.2f}m"
-                else:
-                    label = f"person {dist:.2f}m score={similarity:.2f}"
-                self._draw_box(debug_frame, box_full, (0, 255, 0), label)
+            combined = (W_SIMILARITY * similarity) - (W_POSITION * (dist_px / target_threshold_px))
+            
+            self.get_logger().info(f"Similarity: {similarity:.2f}, Distance: {dist_px:.2f}px, Combined: {combined:.2f}", throttle_duration_sec=1.0)
+            
+            self._draw_box(debug_frame, box_full, (0, 200, 0), f"person {dist_m:.2f}m score={det.score:.2f} sim={similarity:.2f} comb={combined:.2f}", label_offset=4)
+            
+            if combined > best_combined:
+                best_combined = combined
+                best_box, best_dist_m, best_score, best_embedding = box_full, dist_m, best_combined, b_embedding
 
+        return best_box, best_dist_m, best_score, best_embedding
+
+    def _handle_track_response_embedding(self, response, frame_bgr, crop_rect, debug_frame, header):
+        # Nessun percorso veloce qui: senza track_id, OGNI frame e' un
+        # tentativo di riconoscimento pieno (aspetto+posizione+distanza).
+        # La conferma su piu' tentativi (vedi _confirm_reacquisition) scatta
+        # SOLO se il frame precedente era gia' un "miss" — durante il
+        # tracciamento continuo e senza interruzioni, la continuita' di
+        # posizione+distanza frame-su-frame e' gia' una protezione
+        # sufficiente, non serve rallentare anche quel caso.
+        was_continuous = (self._tracking_miss_count == 0)
+        depth_image = self._latest_depth_image
+        
+        
+        for det in response.detections:
+            box_full = (det.x1 + crop_rect[0], det.y1 + crop_rect[1], det.x2 + crop_rect[0], det.y2 + crop_rect[1])
+            self._draw_box(debug_frame, box_full, (100, 100, 100), f"{det.class_name} - {det.score:.2f}", label_offset=3)
+        
+        best_box, best_dist_m, best_score, best_embedding = self._attempt_reacquisition_embedding(
+            response, frame_bgr, crop_rect, depth_image, debug_frame)
+        
+        if best_box is not None and best_score <  REID_COMBINE :
+            best_box = None  # non e' abbastanza simile da essere considerato un match valido
+
+        committed = False
         if best_box is not None:
-            self.lost_frames = 0
+            if was_continuous:
+                committed = True
+                self._reset_reacquisition_confirmation()
+            elif self._confirm_reacquisition(best_box):
+                committed = True
+            else:
+                if debug_frame is not None:
+                    self._draw_box(debug_frame, best_box, (255, 165, 0),
+                                    f"possibile target {best_dist_m:.2f}m "
+                                    f"(conferma {self._reacquisition_count}/{REACQUISITION_STABILITY_FRAMES})" , label_offset=2)
+                self.get_logger().info(
+                    f"TRACKING [embedding_only]: candidato trovato, in attesa di conferma "
+                    f"({self._reacquisition_count}/{REACQUISITION_STABILITY_FRAMES})...", throttle_duration_sec=1.0)
+        else:
+            self._reset_reacquisition_confirmation()
+
+        if committed:
+            if debug_frame is not None:
+                self._draw_box(debug_frame, best_box, (0, 255, 0), f"TARGET {best_dist_m:.2f}m", label_offset=0)
             self._locked_box = best_box
-
-            b_embedding = extract_appearance_embedding(frame_bgr, best_box)
-            if b_embedding is not None and self.reference_embedding is not None:
+            self._tracking_miss_count = 0
+            if best_embedding is not None and self.reference_embedding is not None:
                 self.reference_embedding = (
-                    (1 - REID_EMA_ALPHA) * self.reference_embedding + REID_EMA_ALPHA * b_embedding)
-                self.reference_embedding = cv2.normalize(
-                    self.reference_embedding, None, alpha=1.0, norm_type=cv2.NORM_L1).flatten()
-
+                    (1 - REID_EMA_ALPHA) * self.reference_embedding + REID_EMA_ALPHA * best_embedding)
             self.get_logger().info(
-                f"TRACKING ok: box confermato a {best_dist:.2f}m, similarity={best_score:.2f}",
+                f"TRACKING [embedding_only] ok: confermato a {best_dist_m:.2f}m, similarity={best_score:.2f}",
                 throttle_duration_sec=1.0)
             self._publish_debug(debug_frame, header)
-        else:
-            self._register_lost_frame(debug_frame, header)
+            return
 
-    def _register_lost_frame(self, debug_frame, header):
-        self.lost_frames += 1
+        self._tracking_miss_count += 1
+        if self._tracking_miss_count < TRACKING_GRACE_FRAMES:
+            self.get_logger().info(
+                f"TRACKING [embedding_only]: target non trovato — tentativo "
+                f"{self._tracking_miss_count}/{TRACKING_GRACE_FRAMES} prima di passare a RECOVERY.",
+                throttle_duration_sec=1.0)
+            self._publish_debug(debug_frame, header)
+            return
+
+        self.state = RECOVERY
+        self._recovery_deadline = time.monotonic() + RECOVERY_TIMEOUT_SEC
+        self._tracking_miss_count = 0
         self.get_logger().info(
-            f"TRACKING: nessun box valido questo frame (lost_frames={self.lost_frames}/{LOST_FRAMES_THRESHOLD})",
-            throttle_duration_sec=1.0)
-        if self.lost_frames >= LOST_FRAMES_THRESHOLD:
-            self.get_logger().info("Target perso — torno in SEARCH (nessun trigger manuale richiesto di nuovo).")
-            self.state = SEARCH
-            self.reference_embedding = None
-            self._locked_box = None
-            self._stability_count = 0
-            self._stability_box_center = None
+            f"TRACKING [embedding_only]: target non ritrovato entro {TRACKING_GRACE_FRAMES} frame — "
+            f"passo a RECOVERY (timeout {RECOVERY_TIMEOUT_SEC:.0f}s).")
+        self._publish_debug(debug_frame, header)
+
+    def _handle_recovery_response_embedding(self, response, frame_bgr, crop_rect, debug_frame, header):
+        
+        
+        for det in response.detections:
+            box_full = (det.x1 + crop_rect[0], det.y1 + crop_rect[1], det.x2 + crop_rect[0], det.y2 + crop_rect[1])
+            self._draw_box(debug_frame, box_full, (100, 100, 100), f"{det.class_name} det pre MIN_DETECTION_CONFIDENCE check EMBEDDING_ONLY RECOVERY", label_offset=3)
+        
+        depth_image = self._latest_depth_image
+        best_box, best_dist_m, best_score, best_embedding = self._attempt_reacquisition_embedding(
+            response, frame_bgr, crop_rect, depth_image, debug_frame)
+        
+        
+        if best_box is not None and best_score < REID_COMBINE :
+            best_box = None  # non e' abbastanza simile da essere considerato un match valido
+
+        committed = False
+        if best_box is not None:
+            if self._confirm_reacquisition(best_box):
+                committed = True
+            else:
+                if debug_frame is not None:
+                    self._draw_box(debug_frame, best_box, (255, 165, 0),
+                                    f"possibile target {best_dist_m:.2f}m "
+                                    f"(conferma {self._reacquisition_count}/{REACQUISITION_STABILITY_FRAMES})", label_offset=2)
+        else:
+            self._reset_reacquisition_confirmation()
+
+        if committed:
+            if debug_frame is not None:
+                self._draw_box(debug_frame, best_box, (0, 255, 0), f"TARGET {best_dist_m:.2f}m", label_offset=0)
+            self._locked_box = best_box
+            self.state = TRACKING
+            self._tracking_miss_count = 0
+            self._recovery_deadline = None
+            if best_embedding is not None and self.reference_embedding is not None:
+                self.reference_embedding = (
+                    (1 - REID_EMA_ALPHA) * self.reference_embedding + REID_EMA_ALPHA * best_embedding)
+            self.get_logger().info(
+                f"RECOVERY [embedding_only]: target CONFERMATO a {best_dist_m:.2f}m, "
+                f"similarity={best_score:.2f} — torno a TRACKING.")
+            self._publish_debug(debug_frame, header)
+            return
+
+        remaining = self._recovery_deadline - time.monotonic()
+        if remaining <= 0:
+            self.get_logger().info(
+                f"RECOVERY [embedding_only]: timeout di {RECOVERY_TIMEOUT_SEC:.0f}s scaduto — "
+                f"torno in WAITING_TRIGGER.")
+            self._enter_waiting_trigger()
+        else:
+            self.get_logger().info(
+                f"RECOVERY [embedding_only]: nessuna corrispondenza confermata — {remaining:.0f}s rimanenti.",
+                throttle_duration_sec=1.0)
         self._publish_debug(debug_frame, header)
 
     # ------------------------------------------------------------------
+    # Comune a entrambi i metodi
+    # ------------------------------------------------------------------
+    def _confirm_reacquisition(self, candidate_box):
+        """Richiede che lo STESSO candidato (per posizione) sia il
+        migliore match per REACQUISITION_STABILITY_FRAMES tentativi di
+        fila prima di essere confermato come il target ritrovato — un solo
+        frame fortunato (es. un passante che per un istante somiglia al
+        target ed e' nel punto giusto) non basta piu' a rubargli
+        l'identita'. Ritorna True quando la conferma e' raggiunta (e
+        azzera il contatore per la prossima volta), False se serve ancora
+        attesa — in quel caso il chiamante NON deve ancora agganciare
+        nulla, solo continuare a provare al frame successivo."""
+        candidate_center = box_center(candidate_box)
+        if (self._reacquisition_pending_box is not None
+                and distance(candidate_center, box_center(self._reacquisition_pending_box))
+                <= REACQUISITION_PX_TOLERANCE):
+            self._reacquisition_count += 1
+        else:
+            self._reacquisition_count = 1
+        self._reacquisition_pending_box = candidate_box
+
+        if self._reacquisition_count >= REACQUISITION_STABILITY_FRAMES:
+            self._reacquisition_pending_box = None
+            self._reacquisition_count = 0
+            return True
+        return False
+
+    def _reset_reacquisition_confirmation(self):
+        self._reacquisition_pending_box = None
+        self._reacquisition_count = 0
+
     @staticmethod
-    def _draw_box(frame, box, color, label):
+    def _draw_box(frame, box, color, label, label_offset=0):
         x1, y1, x2, y2 = [int(v) for v in box]
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-        cv2.putText(frame, label, (x1, max(0, y1 - 8)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2, cv2.LINE_AA)
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.5
+        thickness = 2
+        
+        (text_w,text_h), _ = cv2.getTextSize(label, font, font_scale, thickness)
+        
+        h_img, w_img = frame.shape[:2]
+        
+        text_x = min(x1, max(0, w_img - text_w -4))  # 4 pixel di margine a destra
+        line_height = text_h + 10  # 2 pixel di margine sopra e sotto
+        
+        text_y = y1 - 8 - label_offset * line_height
+        text_y = max(text_h + 2, text_y)  # Evita che il testo vada sopra l'immagine
+        
+        cv2.rectangle(frame, (text_x, text_y - text_h - 4), (text_x + text_w + 4, text_y + 4), (0,0,0), -1)
+        
+        cv2.putText(frame, label, (text_x + 2, text_y), font, font_scale, color, thickness, cv2.LINE_AA)
 
     def _publish_debug(self, debug_frame, header):
         if debug_frame is None:

@@ -22,9 +22,9 @@ import numpy as np
 # distanza post-detection in tracking_fsm.py.
 # ============================================================
 CONE_FOV_DEG = 25.0        # apertura TOTALE della ROI, in gradi — larghezza del crop (via intrinseci)
-CONE_MIN_RANGE = 0.5       # distanza minima, in metri (controllo POST-detection, via depth)
-CONE_MAX_RANGE = 4.0       # distanza massima, in metri (controllo POST-detection, via depth)
-CROP_TOP_MARGIN_FRAC = 0     # frazione dell'altezza immagine tagliata dall'ALTO nel crop
+CONE_MIN_RANGE = 1.5       # distanza minima, in metri (controllo POST-detection, via depth)
+CONE_MAX_RANGE = 3.5       # distanza massima, in metri (controllo POST-detection, via depth)
+CROP_TOP_MARGIN_FRAC = 0   # frazione dell'altezza immagine tagliata dall'ALTO nel crop
 CROP_BOTTOM_MARGIN_FRAC = 0  # frazione dell'altezza immagine tagliata dal BASSO nel crop
                                   # Nessun significato fisico ("altezza da terra") — puramente
                                   # pixel: il target deve solo cadere DENTRO il crop, la distanza
@@ -46,6 +46,25 @@ def distance(p1, p2):
     stessa lunghezza)."""
     return math.sqrt(sum((a - b) ** 2 for a, b in zip(p1, p2)))
 
+
+def deproject_pixel_to_point(u, v, depth, fx, fy, cx, cy):
+    """Modello pinhole inverso: pixel (u, v) + profondita' (metri) -> punto
+    3D nel frame OTTICO della camera (x destra, y basso, z avanti —
+    convenzione standard OpenCV/ROS)."""
+    x = (u - cx) * depth / fx
+    y = (v - cy) * depth / fy
+    z = depth
+    return x, y, z
+
+
+def project_point_to_pixel(x, y, z, fx, fy, cx, cy):
+    """Proiezione pinhole diretta: punto 3D nel frame ottico della camera ->
+    pixel (u, v). None se il punto e' dietro la camera (z <= 0)."""
+    if z <= 1e-6:
+        return None
+    u = fx * x / z + cx
+    v = fy * y / z + cy
+    return u, v
 
 
 class CameraIntrinsics:
@@ -99,6 +118,7 @@ def box_center_depth(depth_image, box, patch_frac=0.2, min_patch_px=3, min_valid
         crop = crop / 1000.0
 
     valid = crop[(crop > 0.05) & np.isfinite(crop)]
+    print(f"Min valid value: {valid.min() if valid.size > 0 else 'N/A'}, Max valid value: {valid.max() if valid.size > 0 else 'N/A'}, Valid pixel count: {valid.size}")
     if valid.size < min_valid_pixels:
         return None
     return float(np.median(valid))
@@ -139,11 +159,59 @@ def extract_appearance_embedding(frame_bgr, box, hist_bins=(8, 8, 8)):
 
 
 def embedding_similarity(e1, e2):
-    """Similarita' in [-1, 1] (1 = identico). 0.0 se manca un embedding."""
+    """Similarita' in [-1, 1] (1 = identico). 0.0 se manca un embedding.
+    Per l'istogramma HSV di extract_appearance_embedding — vedi
+    neural_embedding_similarity per il nuovo embedding neurale (da
+    detector_interfaces/BoxDetection.embedding, campo compilato lato yolo)."""
     if e1 is None or e2 is None:
         return 0.0
     return float(cv2.compareHist(e1, e2, cv2.HISTCMP_CORREL))
 
+
+def embedding_from_msg(embedding_field):
+    """Converte il campo ROS BoxDetection.embedding (float32[], vuoto se il
+    DetectorNode non aveva un modello di embedding configurato) in un
+    numpy array, o None se e' vuoto — cosi' il chiamante puo' trattare
+    'array vuoto dal messaggio' e 'nessun embedding' con lo stesso
+    controllo (`is None`), senza dover controllare la lunghezza ogni volta."""
+    if not embedding_field:
+        return None
+    return np.array(embedding_field, dtype=np.float32)
+
+
+def neural_embedding_similarity(e1, e2):
+    """Similarita' coseno in [-1, 1] (1 = identico) tra due embedding
+    NEURALI (da un modello di classificazione separato, penultimo layer —
+    non l'istogramma HSV, che usa embedding_similarity/HISTCMP_CORREL).
+    0.0 se manca un embedding."""
+    if e1 is None or e2 is None:
+        return 0.0
+    n1 = np.linalg.norm(e1)
+    n2 = np.linalg.norm(e2)
+    if n1 < 1e-8 or n2 < 1e-8:
+        return 0.0
+    return float(np.dot(e1, e2)/(n1 * n2))
+
+def rich_neural_embedding_similarity(e1, e2, w_cosine=1.0, w_euclidean=1.0 , w_magnitude=1.0, euclidean_scale=10.0 , magnitude_scale=10.0):
+    """_Combina la similarità coseno e la distanza euclidea sui vettori grezzi (sensibile anche al modulo non solo alla direzione) in un unico punteggio di similarità. Ritorna 0.0 se manca un embedding."""
+    
+    if e1 is None or e2 is None:
+        return 0.0
+    
+    n1 = np.linalg.norm(e1)
+    n2 = np.linalg.norm(e2)
+    
+    cosine = float(np.dot(e1, e2) / (n1 * n2)) if n1 > 1e-8 and n2 > 1e-8 else 0.0
+    euclidean_dist = np.linalg.norm(e1 - e2)
+    euclidean_sim = 1.0 / (1.0 + euclidean_dist / euclidean_scale)  # Normalizza la distanza euclidea in un punteggio di similarità tra 0 e 1
+    magnitude_diff = abs(n1 - n2)
+    magnitude_sim = 1.0 / (1.0 + magnitude_diff / magnitude_scale)  # Normalizza la differenza di magnitudine in un punteggio di similarità
+    total_weight = w_cosine + w_euclidean + w_magnitude
+    
+    print(f"Cosine: {cosine:.4f}, Euclidean Sim: {euclidean_sim:.4f}, Magnitude Sim: {magnitude_sim:.4f}, Total Weight: {total_weight:.4f}")
+    
+    
+    return (w_cosine * cosine + w_euclidean * euclidean_sim + w_magnitude * magnitude_sim) / total_weight 
 
 # ============================================================
 # ROI come crop dell'immagine (design a camera singola: braccio)

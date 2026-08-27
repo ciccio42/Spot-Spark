@@ -1,14 +1,21 @@
 # Richiesta di detection al DetectorNode (container yolo).
 #
-# Detection SEMPRE sull'immagine intera — nessuna ROI/crop qui: quella
-# logica (proiezione del cono, eventuale filtro sui risultati, disegno dei
-# bordi per il debug) vive in demo_package, non nel DetectorPackage.
+# L'immagine puo' essere l'immagine intera o un ritaglio (crop) — il
+# servizio non fa differenza, elabora quello che riceve. La logica di ROI
+# (calcolo del ritaglio, traduzione delle coordinate) vive in demo_package,
+# non qui.
 
 sensor_msgs/Image image
 
 # Se vuoto, il nodo usa le classi di default configurate (parametro ROS2
 # default_classes).
 string[] target_classes
+
+# Se True, il tracker interno (BoT-SORT, stato mantenuto tra chiamate
+# consecutive) viene azzerato PRIMA di elaborare questa richiesta — usalo
+# quando riparti da zero (es. tracking_fsm torna in SEARCH dopo aver perso
+# il target), cosi' un vecchio track_id non riemerga in una sessione nuova.
+bool reset_tracker false
 
 ---
 

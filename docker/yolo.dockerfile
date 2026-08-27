@@ -21,12 +21,27 @@ RUN pip3 install --no-cache-dir \
 
 # 3. Installa Ultralytics e NumPy dal PyPI standard
 RUN pip3 install --no-cache-dir \
-    ultralytics \
-    numpy
+    ultralytics
+
+RUN pip install --break-system-packages \
+    tensorboard \
+    gdown \
+    huggingface_hub
+
+
+RUN pip install --break-system-packages "numpy<2"
+
+RUN pip install --break-system-packages cython setuptools numpy
+RUN pip install --break-system-packages --no-build-isolation \
+    https://github.com/KaiyangZhou/deep-person-reid/archive/refs/heads/master.zip
 
 # Creazione del workspace dedicato a YOLO
 RUN mkdir -p /home/yolo_ws/src
 WORKDIR /home/yolo_ws
+
+
+
+RUN hf download kaiyangzhou/osnet --local-dir /home/yolo_ws/osnet
 
 # Assicura il source di ROS 2
 RUN echo "source /opt/ros/${ROS_DISTRO}/setup.bash" >> /root/.bashrc
