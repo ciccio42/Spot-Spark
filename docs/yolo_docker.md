@@ -12,6 +12,7 @@ xhost +local:root
 
 docker run -it --rm \
   --name yolo-container \
+  --runtime=nvidia \
   --gpus all \
   --privileged \
   --net=host \

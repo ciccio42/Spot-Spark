@@ -96,5 +96,5 @@ class DetectClient:
             self.node.get_logger().warn(f"Chiamata al servizio detect fallita: {result['error']}")
             return None
 
-        self.node.get_logger().info(f"[DetectClient] round-trip (sincrono): {elapsed_ms:.0f} ms")
+        self.node.get_logger().warn(f"[DetectClient] round-trip (sincrono): {elapsed_ms:.0f} ms")
         return result.get('response')

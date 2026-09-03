@@ -20,6 +20,7 @@ setup(
     entry_points={
         'console_scripts': [
             'tracking_fsm = demo_package.tracking_fsm:main',
+            'nav2_bridge = demo_package.nav2_bridge:main'
         ],
     },
 )

@@ -31,7 +31,7 @@ class DetectorNode(Node):
         self.declare_parameter('conf_threshold', 0.35)
         self.declare_parameter('imgsz', 640)
         self.declare_parameter('service_name', 'detect')
-        self.declare_parameter('use_tracker', True)  # True: model.track() con BoT-SORT (track_id
+        self.declare_parameter('use_tracker', False)  # True: model.track() con BoT-SORT (track_id
                                                         # persistente); False: detect() semplice, per
                                                         # confronto/debug — nessun track_id, sempre -1.
         self.declare_parameter('tracker_config', '/home/yolo_ws/src/yolo/detector_package/oc_sort.yaml')  # percorso del file di config del

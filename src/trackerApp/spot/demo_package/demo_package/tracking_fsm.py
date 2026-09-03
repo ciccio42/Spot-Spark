@@ -36,21 +36,23 @@ import time
 import cv2
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import qos_profile_sensor_data, QoSProfile, ReliabilityPolicy, HistoryPolicy
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from cv_bridge import CvBridge
 from sensor_msgs.msg import Image, CompressedImage, CameraInfo
 from geometry_msgs.msg import PoseStamped
+from demo_interfaces.msg import TargetInfoMessage, TargetPose3D
 
 from demo_package.common import (
     CameraIntrinsics, box_center, distance,
     extract_appearance_embedding, embedding_similarity,
     embedding_from_msg, neural_embedding_similarity,
-    compute_roi_crop_rect, scale_box_to_depth, box_center_depth, rich_neural_embedding_similarity,
+    compute_roi_crop_rect, scale_box_to_depth, box_center_depth, rich_neural_embedding_similarity, deproject_pixel_to_point,
     CONE_FOV_DEG, CONE_MIN_RANGE, CONE_MAX_RANGE,
 )
 from demo_package.detect_client import DetectClient
+
 
 INIT = "init"
 WAITING_TRIGGER = "waiting_trigger"
@@ -63,17 +65,19 @@ RECOVERY = "recovery"
 # sessione. Cambia questo, ricompila, testa; per confrontare i due
 # metodi servono due sessioni separate, non uno switch a runtime.
 # ============================================================
-TRACKING_METHOD = "botsort_hsv"  # "botsort_hsv" oppure "embedding_only"
+TRACKING_METHOD = "embedding_only"  # "botsort_hsv" oppure "embedding_only"
 
 # ============================================================
 # Valori scritti qui, nessun argomento da terminale.
 # ============================================================
-HAND_RGB_TOPIC = '/out/compressed'
+HAND_RGB_TOPIC = 'camera/hand/compressed'
 HAND_RGB_COMPRESSED = True   # True su bag, False sul robot vero se manca il nodo di ricompressione
 HAND_CAMERA_INFO_TOPIC = '/camera/hand/camera_info'
 HAND_DEPTH_TOPIC = '/depth/hand/image'   # depth ToF della camera del braccio — verifica il nome reale
-GOAL_FRAME = 'map'
-GOAL_UPDATE_TOPIC = 'goal_update'
+GOAL_FRAME = 'odom'
+
+TARGET_POSE_TOPIC = 'target_info'  # suffisso _3d: convenzione demo_interfaces, stessa di /person_follow/target_info
+
 DETECT_SERVICE = 'detect'
 TARGET_CLASSES = ['person']
 DEBUG_IMAGE_TOPIC = '/person_follow/hand_debug/compressed'  # suffisso /compressed: convenzione
@@ -131,6 +135,8 @@ class TrackingFSM(Node):
         self._hand_optical_frame = None
         self._latest_depth_image = None
         self._last_image_cb_time = None
+        
+        self._last_response_time = None  # time.monotonic() dell'ultima risposta ricevuta dal servizio Detect
 
         # "Blocchiamo tutto": camera_info, depth e image sono nello stesso
         # gruppo — quando _image_cb resta bloccata ad aspettare la risposta
@@ -168,18 +174,25 @@ class TrackingFSM(Node):
                                                # chiede anche l'azzeramento del tracker BoT-SORT
 
         self._start_trigger_thread()
+        
+        sensor_qos_depth1 = QoSProfile(
+    reliability=ReliabilityPolicy.BEST_EFFORT,
+    history=HistoryPolicy.KEEP_LAST,
+    depth=1
+)
 
         self.create_subscription(CameraInfo, HAND_CAMERA_INFO_TOPIC, self._camera_info_cb,
                                   qos_profile_sensor_data, callback_group=self._main_group)
         self.create_subscription(Image, HAND_DEPTH_TOPIC, self._depth_cb,
-                                  qos_profile_sensor_data, callback_group=self._main_group)
+                                  sensor_qos_depth1, callback_group=self._main_group)
 
         hand_rgb_msg_type = CompressedImage if HAND_RGB_COMPRESSED else Image
         self.create_subscription(hand_rgb_msg_type, HAND_RGB_TOPIC, self._image_cb,
-                                  qos_profile_sensor_data, callback_group=self._main_group)
+                                  sensor_qos_depth1, callback_group=self._main_group)
+        
+        self.target_pose_pub = self.create_publisher(TargetInfoMessage, TARGET_POSE_TOPIC, 1)
 
-        self.goal_pub = self.create_publisher(PoseStamped, GOAL_UPDATE_TOPIC, 5)
-        self.debug_pub = self.create_publisher(CompressedImage, DEBUG_IMAGE_TOPIC, 5)
+        self.debug_pub = self.create_publisher(CompressedImage, DEBUG_IMAGE_TOPIC, 1)
         
 
         self.get_logger().info(
@@ -248,14 +261,35 @@ class TrackingFSM(Node):
         self._latest_depth_image = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding='passthrough')
         
         
+    def _publish_target_info(self, box_full, dist, header):
+        """"Pubblica le informazioni del target (bounding box, distanza) in un messaggio."""
         
+        if self._last_response_time is not None:
+            elapsed_ms = (time.monotonic() - self._last_response_time) * 1000.0
+            self.get_logger().warn(f"[tracking_fsm] round-trip (sincrono): {elapsed_ms:.0f} ms")
+        
+        target_info_msg = TargetInfoMessage()
+        target_info_msg.header = header
+        target_info_msg.bounding_box = [float(v) for v in box_full]
+        target_info_msg.depth_m = float(dist)
+        target_info_msg.camera_rgb_topic = HAND_RGB_TOPIC
+
+        target_info_msg.camera_depth_topic = HAND_DEPTH_TOPIC
+
+        self.target_pose_pub.publish(target_info_msg)
+
 
     # ------------------------------------------------------------------
     # Dispatch per stato — il debug e' costruito e pubblicato SEMPRE
     # (tutti gli stati), la detection gira SOLO in SEARCH/TRACKING/RECOVERY.
     # ------------------------------------------------------------------
     def _image_cb(self, rgb_msg):
-        t_start = time.monotonic()
+        t_start = time.time()
+        
+        image_stamp = rgb_msg.header.stamp.sec + rgb_msg.header.stamp.nanosec * 1e-9
+        queue_delay_ms = (t_start - image_stamp) * 1000.0
+        self.get_logger().warn(f"[tracking_fsm] _image_cb: latenza tra cattura ed elaborazione: queue delay={queue_delay_ms:.0f}ms", throttle_duration_sec=1.0)
+        
         since_last = (t_start - self._last_image_cb_time) * 1000.0 if self._last_image_cb_time else -1.0
         self._last_image_cb_time = t_start
 
@@ -322,6 +356,8 @@ class TrackingFSM(Node):
         reset_now = self._pending_tracker_reset
         self._pending_tracker_reset = False
         response = self.detect_client.call_sync(crop_msg, target_classes=TARGET_CLASSES, reset_tracker=reset_now)
+        
+        self._last_response_time = time.monotonic()
 
         try:
             if TRACKING_METHOD == "botsort_hsv":
@@ -776,6 +812,7 @@ class TrackingFSM(Node):
         # Stabile per abbastanza frame: aggancio.
         self.reference_embedding = box_embedding
         self._locked_box = box_full
+        self._publish_target_info(box_full, dist, header)
         self.state = TRACKING
         self._stability_count = 0
         self._stability_reference_embedding = None
@@ -876,12 +913,15 @@ class TrackingFSM(Node):
                     f"({self._reacquisition_count}/{REACQUISITION_STABILITY_FRAMES})...", throttle_duration_sec=1.0)
         else:
             self._reset_reacquisition_confirmation()
+            
+        
 
         if committed:
             if debug_frame is not None:
                 self._draw_box(debug_frame, best_box, (0, 255, 0), f"TARGET {best_dist_m:.2f}m", label_offset=0)
             self._locked_box = best_box
             self._tracking_miss_count = 0
+            self._publish_target_info(best_box, best_dist_m, header)
             if best_embedding is not None and self.reference_embedding is not None:
                 self.reference_embedding = (
                     (1 - REID_EMA_ALPHA) * self.reference_embedding + REID_EMA_ALPHA * best_embedding)
@@ -899,7 +939,8 @@ class TrackingFSM(Node):
                 throttle_duration_sec=1.0)
             self._publish_debug(debug_frame, header)
             return
-
+        
+        
         self.state = RECOVERY
         self._recovery_deadline = time.monotonic() + RECOVERY_TIMEOUT_SEC
         self._tracking_miss_count = 0
@@ -934,6 +975,8 @@ class TrackingFSM(Node):
                                     f"(conferma {self._reacquisition_count}/{REACQUISITION_STABILITY_FRAMES})", label_offset=2)
         else:
             self._reset_reacquisition_confirmation()
+            
+        
 
         if committed:
             if debug_frame is not None:
@@ -941,6 +984,7 @@ class TrackingFSM(Node):
             self._locked_box = best_box
             self.state = TRACKING
             self._tracking_miss_count = 0
+            self._publish_target_info(best_box, best_dist_m, header)
             self._recovery_deadline = None
             if best_embedding is not None and self.reference_embedding is not None:
                 self.reference_embedding = (
@@ -950,6 +994,7 @@ class TrackingFSM(Node):
                 f"similarity={best_score:.2f} — torno a TRACKING.")
             self._publish_debug(debug_frame, header)
             return
+        
 
         remaining = self._recovery_deadline - time.monotonic()
         if remaining <= 0:

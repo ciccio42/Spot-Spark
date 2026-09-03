@@ -16,8 +16,8 @@ RUN apt-get update && apt-get install -y \
 RUN pip3 install --no-cache-dir --upgrade pip
 
 # 2. Installa PyTorch con supporto CUDA da PyTorch Wheel Index
-RUN pip3 install --no-cache-dir \
-    torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+RUN python3 -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128 --break-system-packages --no-cache-dir --ignore-installed
+
 
 # 3. Installa Ultralytics e NumPy dal PyPI standard
 RUN pip3 install --no-cache-dir \
@@ -28,10 +28,8 @@ RUN pip install --break-system-packages \
     gdown \
     huggingface_hub
 
-
-RUN pip install --break-system-packages "numpy<2"
-
-RUN pip install --break-system-packages cython setuptools numpy
+RUN pip install --break-system-packages cython 'setuptools<71' 
+RUN pip install --break-system-packages 'numpy==1.26.4'
 RUN pip install --break-system-packages --no-build-isolation \
     https://github.com/KaiyangZhou/deep-person-reid/archive/refs/heads/master.zip
 

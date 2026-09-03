@@ -213,6 +213,7 @@ def rich_neural_embedding_similarity(e1, e2, w_cosine=1.0, w_euclidean=1.0 , w_m
     
     return (w_cosine * cosine + w_euclidean * euclidean_sim + w_magnitude * magnitude_sim) / total_weight 
 
+
 # ============================================================
 # ROI come crop dell'immagine (design a camera singola: braccio)
 # ============================================================
