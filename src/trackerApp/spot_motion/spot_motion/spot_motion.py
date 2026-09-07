@@ -45,7 +45,9 @@ import bosdyn.client
 import bosdyn.client.util
 from bosdyn.api import geometry_pb2
 from bosdyn.api.spot import robot_command_pb2 as spot_command_pb2
-from bosdyn.client.frame_helpers import BODY_FRAME_NAME, get_a_tform_b
+from bosdyn.client import math_helpers
+from bosdyn.client.frame_helpers import (
+    BODY_FRAME_NAME, ODOM_FRAME_NAME, get_a_tform_b, get_se2_a_tform_b)
 from bosdyn.client.image import ImageClient
 from bosdyn.client.lease import LeaseClient, LeaseKeepAlive
 from bosdyn.client.robot_command import RobotCommandBuilder, RobotCommandClient, blocking_stand
@@ -61,15 +63,74 @@ SPOT_HOSTNAME = '192.168.80.3'  # <-- metti l'IP vero del tuo Spot
 SPOT_USERNAME = 'admin'         # <-- SOLO per la prova iniziale, vedi nota sopra
 SPOT_PASSWORD = 'prb4e3wparqx'  #     da spostare su env var prima di qualunque commit
 COMMAND_DURATION = 3.0          # secondi — rete di sicurezza end_time_secs
-DRY_RUN =True              # True: calcola e logga SENZA mai inviare comandi al robot
+DRY_RUN = False                 # True: calcola e logga SENZA mai inviare comandi al robot
 HAND_CAMERA_IMAGE_SOURCE = 'hand_color_image'
 WRIST_FRAME_NAME = 'arm0.link_wr1'  # verificato: presente in entrambi gli snapshot
 TARGET_DISTANCE = 2.5           # metri — distanza che Spot cerca sempre di mantenere
 DISTANCE_TOLERANCE = 0.15       # metri — sotto questo scarto, resta fermo (solo rotazione)
-MAX_LINEAR_VEL = 0.3   # m/s — molto sotto il massimo hardware di Spot; abbassa se serve
+MAX_LINEAR_VEL = 0.6   # m/s — molto sotto il massimo hardware di Spot; abbassa se serve
                          #       ancora piu' lento, il comando non "va veloce" oltre questo
 MAX_ANGULAR_VEL = 0.5  # rad/s — stesso principio per la rotazione
+KF_PROCESS_VAR = 0.05       # rumore di PROCESSO — quanto ci aspettiamo che la velocita' vera del
+                              # target possa cambiare (piu' alto = filtro piu' reattivo a cambi di
+                              # direzione/curve, ma smussa meno il rumore)
+KF_MEASUREMENT_VAR = 0.05   # rumore di MISURA — quanto ci fidiamo della singola bx,by grezza
+                              # (piu' alto = smussa di piu', ma reagisce piu' lentamente ai cambi veri)
+KF_RESET_GAP_SEC = 1.0      # se passa piu' di questo dall'ultimo aggiornamento, il filtro si
+                              # REINIZIALIZZA sulla nuova misura invece di fonderla con uno stato
+                              # ormai troppo vecchio (es. dopo una RECOVERY prolungata)
 # ============================================================
+
+
+def _se2_transform_point(a_tform_b, x, y):
+    """Trasforma un punto (x,y) dal frame b al frame a. SE2Pose non ha un
+    transform_point diretto (a differenza di Quat/SE3Pose, verificato) —
+    lo otteniamo componendo con .mult(), l'unico metodo di composizione
+    confermato: un punto e' una SE2Pose con angle=0, il risultato della
+    composizione ne eredita la posizione trasformata."""
+    result = a_tform_b.mult(math_helpers.SE2Pose(x, y, 0.0))
+    return result.x, result.y
+
+
+class _ConstantVelocityKalman1D:
+    """Filtro di Kalman 1D, modello a velocita' costante: stato [pos, vel].
+    Usato due volte (assi x e y indipendenti) per smussare la posizione del
+    target nel frame ODOM (fisso nel mondo — MAI il frame body, che si
+    muove col robot: stimare una velocita' su coordinate che si muovono
+    gia' da sole mescolerebbe il moto del target con quello del robot)."""
+
+    def __init__(self, process_var, measurement_var):
+        self.pos = 0.0
+        self.vel = 0.0
+        self.P = [[1e3, 0.0], [0.0, 1e3]]  # covarianza iniziale alta: non ci fidiamo ancora di nulla
+        self.q = process_var
+        self.r = measurement_var
+
+    def reset(self, pos):
+        self.pos = pos
+        self.vel = 0.0
+        self.P = [[1e3, 0.0], [0.0, 1e3]]
+
+    def predict(self, dt):
+        self.pos = self.pos + self.vel * dt
+        p00, p01, p10, p11 = self.P[0][0], self.P[0][1], self.P[1][0], self.P[1][1]
+        self.P = [
+            [p00 + dt * (p10 + p01) + dt * dt * p11 + self.q * dt, p01 + dt * p11],
+            [p10 + dt * p11, p11 + self.q * dt],
+        ]
+
+    def update(self, measurement):
+        innovation = measurement - self.pos
+        s = self.P[0][0] + self.r
+        k_pos = self.P[0][0] / s
+        k_vel = self.P[1][0] / s
+        self.pos = self.pos + k_pos * innovation
+        self.vel = self.vel + k_vel * innovation
+        p00, p01 = self.P[0][0], self.P[0][1]
+        self.P = [
+            [self.P[0][0] - k_pos * p00, self.P[0][1] - k_pos * p01],
+            [self.P[1][0] - k_vel * p00, self.P[1][1] - k_vel * p01],
+        ]
 
 
 class MotionCommandNode(Node):
@@ -85,6 +146,9 @@ class MotionCommandNode(Node):
                 max_vel=geometry_pb2.SE2Velocity(
                     linear=geometry_pb2.Vec2(x=MAX_LINEAR_VEL, y=MAX_LINEAR_VEL),
                     angular=MAX_ANGULAR_VEL)))
+        self._kf_x = _ConstantVelocityKalman1D(KF_PROCESS_VAR, KF_MEASUREMENT_VAR)
+        self._kf_y = _ConstantVelocityKalman1D(KF_PROCESS_VAR, KF_MEASUREMENT_VAR)
+        self._kf_last_update_time = None
 
         self.create_subscription(TargetPose3D, 'target_3d', self._on_target_pose, 1)
 
@@ -96,27 +160,44 @@ class MotionCommandNode(Node):
             f"'NESSUN comando verra\\' inviato al robot' if self._dry_run else 'comandi ATTIVI'.")
 
     def _on_target_pose(self, msg: TargetPose3D):
-        """
-        Callback per il topic 'target_3d'.
-        msg.position: posizione del target nel frame della camera (ottico)
-        msg.yaw: yaw del target nel frame della camera (ottico)
-        calcola la posizione del target nel frame del corpo (body) e invia un comando di movimento a Spot.
-        """
-        t0 = time.monotonic()
-        
         transforms = self.robot_state_client.get_robot_state().kinematic_state.transforms_snapshot
-        
-        self.get_logger().warn(f"[Pose3DEstimationNode] round-trip: {(time.monotonic() - t0) * 1000:.0f} ms")
-        
-        stamp_sec = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
-        age = time.time() - stamp_sec
-        self.get_logger().info(f"[LATENZA] dato vecchio di {age*1000:.2f}ms", throttle_duration_sec=0.5)
 
         body_tform_wrist = get_a_tform_b(transforms, BODY_FRAME_NAME, WRIST_FRAME_NAME)
         body_tform_camera = body_tform_wrist * self._wrist_tform_camera
 
         bx, by, bz = body_tform_camera.transform_point(
             msg.position.x, msg.position.y, msg.position.z)
+
+        # --- Filtro di Kalman, nel frame ODOM (fisso), non su bx,by direttamente ---
+        odom_tform_body = get_se2_a_tform_b(transforms, ODOM_FRAME_NAME, BODY_FRAME_NAME)
+        world_x, world_y = _se2_transform_point(odom_tform_body, bx, by)
+
+        now = time.monotonic()
+        if self._kf_last_update_time is None or (now - self._kf_last_update_time) > KF_RESET_GAP_SEC:
+            # Prima misura, o gap troppo lungo dall'ultima (es. dopo una
+            # RECOVERY prolungata) — reinizializza sulla misura grezza
+            # invece di fondere con uno stato ormai privo di significato.
+            self._kf_x.reset(world_x)
+            self._kf_y.reset(world_y)
+        else:
+            dt = now - self._kf_last_update_time
+            self._kf_x.predict(dt)
+            self._kf_y.predict(dt)
+            self._kf_x.update(world_x)
+            self._kf_y.update(world_y)
+        self._kf_last_update_time = now
+
+        # Posizione SMUSSATA, di nuovo nel frame body — sostituisce bx,by
+        # grezzi per tutto il resto del calcolo (distanza, direzione, comando).
+        # NOTA: get_se2_a_tform_b(transforms, BODY_FRAME_NAME, ODOM_FRAME_NAME)
+        # tornerebbe None — richiede che il PRIMO frame sia gravity-aligned
+        # (odom/vision/flat_body), e 'body' non lo e' garantito (segue
+        # l'inclinazione vera del robot). Si inverte invece odom_tform_body,
+        # gia' calcolato con successo sopra, con .inverse() — nessuna
+        # seconda chiamata all'albero dei frame, nessun crash.
+        body_tform_odom = odom_tform_body.inverse()
+        bx, by = _se2_transform_point(body_tform_odom, self._kf_x.pos, self._kf_y.pos)
+        # --- fine filtro ---
 
         goal_heading_rt_body = math.atan2(by, bx)
 
@@ -125,10 +206,7 @@ class MotionCommandNode(Node):
         if r_horizontal > TARGET_DISTANCE + DISTANCE_TOLERANCE:
             zone = "si avvicina"
             scale = (r_horizontal - TARGET_DISTANCE) / r_horizontal
-            #dx = bx - TARGET_DISTANCE
-            #dy = 0
-            
-            dx , dy = bx * scale, by * scale
+            dx, dy = bx * scale, by * scale
         else:
             zone = "a distanza (fermo)"
             dx, dy = 0.0, 0.0
