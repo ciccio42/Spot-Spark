@@ -710,6 +710,8 @@ class TrackingFSM(Node):
     # ====================================================================
 
     def _handle_search_response_embedding(self, response, frame_bgr, crop_rect, debug_frame, header):
+        
+        self.reference_embedding = None  # in SEARCH non ci fidiamo di nessun embedding precedente — serve un candidato stabile nuovo
         if response is None:
             self._publish_debug(debug_frame, header)
             return

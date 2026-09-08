@@ -26,6 +26,7 @@ WORKDIR /home/spot_ws/src
 RUN git clone https://github.com/ciccio42/spot_ros2.git
 WORKDIR /home/spot_ws/src/spot_ros2
 RUN git submodule init && git submodule update && ./install_spot_ros2.sh --arm64
+COPY src/spot_launch_helpers.py /home/spot_ws/src/spot_ros2/spot_common/spot_common/launch/spot_launch_helpers.py
 WORKDIR /home/spot_ws
 RUN source /opt/ros/${ROS_DISTRO}/setup.bash && colcon build --symlink-install
 
