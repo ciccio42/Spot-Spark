@@ -21,7 +21,7 @@ import numpy as np
 # automaticamente sia al crop (compute_roi_crop_rect) sia al controllo di
 # distanza post-detection in tracking_fsm.py.
 # ============================================================
-CONE_FOV_DEG = 90.0        # apertura TOTALE della ROI, in gradi — larghezza del crop (via intrinseci)
+CONE_FOV_DEG = 35.0        # apertura TOTALE della ROI, in gradi — larghezza del crop (via intrinseci)
 CONE_MIN_RANGE = 1.5       # distanza minima, in metri (controllo POST-detection, via depth)
 CONE_MAX_RANGE = 3.5       # distanza massima, in metri (controllo POST-detection, via depth)
 CROP_TOP_MARGIN_FRAC = 0   # frazione dell'altezza immagine tagliata dall'ALTO nel crop

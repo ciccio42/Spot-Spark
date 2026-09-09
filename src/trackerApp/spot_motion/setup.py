@@ -1,3 +1,5 @@
+import os
+from glob import glob
 from setuptools import find_packages, setup
 
 package_name = 'spot_motion'
@@ -10,6 +12,9 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
+        (os.path.join('share', package_name, 'launch'), glob('launch/*.py')),
+        (os.path.join('share', package_name, 'config'), glob('config/*.yaml')),
+        (os.path.join('share', package_name, 'bt'), glob('bt/*.xml')),
     ],
     install_requires=['setuptools', 'bosdyn-client'],
     zip_safe=True,
@@ -25,7 +30,8 @@ setup(
     entry_points={
         'console_scripts': [
             'pose_3d_estimation = spot_motion.pose_3d_estimation:main',
-            'spot_motion = spot_motion.spot_motion:main'
+            'spot_motion = spot_motion.spot_motion:main',
+            'nav2_bridge = spot_motion.nav2_bridge:main',
         ],
     },
 )
