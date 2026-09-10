@@ -10,3 +10,4 @@ src/trackerApp/spot_bags_code/*
 *pt
 .DS_Store
 *.ts
+*bag*
