@@ -21,6 +21,9 @@ RUN pip3 install --no-cache-dir --upgrade pip \
     bosdyn-api==5.0.1 \
     bosdyn-core==5.0.1
 
+RUN apt update && apt install -y ros-${ROS_DISTRO}-robot-localization \
+    && rm -rf /var/lib/apt/lists/*
+
 RUN mkdir -p /home/spot_ws/src
 WORKDIR /home/spot_ws/src
 RUN git clone https://github.com/ciccio42/spot_ros2.git

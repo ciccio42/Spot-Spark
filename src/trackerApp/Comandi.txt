@@ -1,7 +1,7 @@
 #Comandi utili
 
 #Publicazione di msg/Twist per /cmd_vel a 10Hz
-ros2 topic pub -r 10 /cmd_vel geometry_msgs/msg/Twist "{linear : {x: 0.1, y: 0.0, z: 0.0}, angular:{z: 0.0}}"
+ros2 topic pub -r 10 /cmd_vel geometry_msgs/msg/Twist "{linear : {x: 1.0, y: 0.0, z: 0.0}, angular:{z: 0.0}}"
 
 
 #Replay dei bags
@@ -32,4 +32,8 @@ ros2 run rqt_image_view rqt_image_view /person_follow/hand_debug/compressed
 
 # 2. Lasciando che rqt scopra da solo il trasporto: seleziona la BASE (senza /compressed)
 ros2 run rqt_image_view rqt_image_view /person_follow/hand_debug
+
+pkill -9 -f "ign gazebo"; pkill -9 -f parameter_bridge; pkill -9 -f quadruped_controller; pkill -9 -f state_estimation; pkill -9 -f robot_state_publisher; pkill -9 -f ekf_node
+ros2 launch champ_bringup champ_bringup.launch.py use_sim_time:=true use_rviz:=true
+
 

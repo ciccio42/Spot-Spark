@@ -31,6 +31,9 @@ RUN apt update && apt install -y ros-$ROS_DISTRO-desktop \
 RUN apt update && apt install -y python3-colcon-common-extensions \
     && rm -rf /var/lib/apt/lists/*
 
+RUN apt update && apt install -y ros-${ROS_DISTRO}-robot-localization \
+    && rm -rf /var/lib/apt/lists/*
+
 # ROS environment
 SHELL ["/bin/bash", "-c"]
 RUN echo "source /opt/ros/${ROS_DISTRO}/setup.bash" >> /root/.bashrc

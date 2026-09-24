@@ -28,7 +28,7 @@ from ament_index_python.packages import get_package_share_directory
 
 def generate_launch_description():
     package_dir = get_package_share_directory('spot_motion')
-    params_file = os.path.join(package_dir, 'config', 'nav2_params_spot_real.yaml')
+    params_file = os.path.join(package_dir, 'config', 'nav2_params_spot_sim.yaml')
 
     # $(find-pkg-share ...) dentro il YAML non viene MAI risolto: quella
     # sintassi la capisce solo il sistema di lancio (file .launch.xml o
@@ -45,13 +45,13 @@ def generate_launch_description():
     ]
 
     return LaunchDescription([
-        Node(
-            package='nav2_controller',
-            executable='controller_server',
-            name='controller_server',
-            output='screen',
-            parameters=[params_file],
-        ),
+        # Node(
+        #     package='nav2_controller',
+        #     executable='controller_server',
+        #     name='controller_server',
+        #     output='screen',
+        #     parameters=[params_file],
+        # ),
         Node(
             package='nav2_planner',
             executable='planner_server',
@@ -73,13 +73,13 @@ def generate_launch_description():
             output='screen',
             parameters=[params_file, {'default_nav_to_pose_bt_xml': bt_xml_path}],
         ),
-        Node(
-            package='nav2_velocity_smoother',
-            executable='velocity_smoother',
-            name='velocity_smoother',
-            output='screen',
-            parameters=[params_file],
-        ),
+        # Node(
+        #     package='nav2_velocity_smoother',
+        #     executable='velocity_smoother',
+        #     name='velocity_smoother',
+        #     output='screen',
+        #     parameters=[params_file],
+        # ),
         Node(
             package='nav2_lifecycle_manager',
             executable='lifecycle_manager',
@@ -87,4 +87,19 @@ def generate_launch_description():
             output='screen',
             parameters=[params_file],
         ),
+        
+        Node(
+            package='nav2_controller', 
+            executable='controller_server',
+            name='controller_server', output='screen',
+            parameters=[params_file],
+            remappings=[('cmd_vel', 'cmd_vel_nav')]),
+
+        Node(
+            package='nav2_velocity_smoother', 
+            executable='velocity_smoother',
+            name='velocity_smoother', output='screen',
+            parameters=[params_file],
+            remappings=[('cmd_vel', 'cmd_vel_nav'),
+                     ('cmd_vel_smoothed', 'cmd_vel')]),
     ])
