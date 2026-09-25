@@ -1,21 +1,29 @@
 <!--
-  This Behavior Tree follows a dynamic pose to a certain distance
+  Segue una posa dinamica mantenendo una distanza fissa dal bersaglio.
+  Il goal viene aggiornato tramite /goal_update (GoalUpdater) da nav2_bridge.
+  In caso di errore del controller (es. collisione prevista da RPP) svuota il
+  costmap locale, attende e riprova: al nuovo tentativo il percorso viene
+  ricalcolato tenendo conto dell'ostacolo presente nel costmap globale.
 -->
-
 <root main_tree_to_execute="MainTree">
   <BehaviorTree ID="MainTree">
-    <PipelineSequence name="NavigateWithReplanning">
-      <RateController hz="1.0">
-        <Sequence>
-          <GoalUpdater input_goal="{goal}" output_goal="{updated_goal}">
-            <ComputePathToPose goal="{updated_goal}" path="{path}" planner_id="GridBased" />
-          </GoalUpdater>
-          <TruncatePath distance="1.2" input_path="{path}" output_path="{truncated_path}" />
-        </Sequence>
-      </RateController>
-      <KeepRunningUntilFailure>
-        <FollowPath path="{truncated_path}" controller_id="FollowPath" />
-      </KeepRunningUntilFailure>
-    </PipelineSequence>
+    <RecoveryNode number_of_retries="10" name="FollowWithRecovery">
+      <PipelineSequence name="FollowWithReplanning">
+        <RateController hz="3.0">
+          <Sequence>
+            <GoalUpdater input_goal="{goal}" output_goal="{updated_goal}">
+              <ComputePathToPose goal="{updated_goal}" path="{path}" planner_id="GridBased" />
+            </GoalUpdater>
+            <TruncatePath distance="0.0" input_path="{path}" output_path="{truncated_path}" />
+          </Sequence>
+        </RateController>
+        <KeepRunningUntilFailure>
+          <FollowPath path="{truncated_path}" controller_id="FollowPath" />
+        </KeepRunningUntilFailure>
+      </PipelineSequence>
+      <Sequence name="Recovery">
+        <Wait wait_duration="1" />
+      </Sequence>
+    </RecoveryNode>
   </BehaviorTree>
 </root>
