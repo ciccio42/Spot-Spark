@@ -37,3 +37,11 @@ pkill -9 -f "ign gazebo"; pkill -9 -f parameter_bridge; pkill -9 -f quadruped_co
 ros2 launch champ_bringup champ_bringup.launch.py use_sim_time:=true use_rviz:=true
 
 
+
+
+colcon build --symlink-install --packages-ignore champ_gazebo
+
+
+ros2 topic pub --once /arm_controller/joint_trajectory trajectory_msgs/msg/JointTrajectory \
+"{joint_names: [arm_sh0, arm_sh1, arm_el0, arm_el1, arm_wr0, arm_wr1, arm_f1x],
+  points: [{positions: [0.0, -3.1, 3.1, 0.0, 0.0, 0.0, 0.0], time_from_start: {sec: 3}}]}"

@@ -14,10 +14,10 @@ che una contamini l'altra.
       coinvolto, in nessuno stato.
 
   "embedding_only": l'identita' si basa SOLO sull'embedding neurale
-      (modello di classificazione separato, vedi embedding_model_path lato
-      DetectorNode) — in TUTTI gli stati, SEARCH compreso. BoT-SORT/track_id
-      non vengono mai usati per decidere chi e' il target (anche se il
-      servizio li calcola comunque, semplicemente li ignoriamo).
+      (modello di ReID separato lato DetectorNode) — in TUTTI gli stati,
+      SEARCH compreso. BoT-SORT/track_id non vengono mai usati per decidere
+      chi e' il target (anche se il servizio li calcola comunque,
+      semplicemente li ignoriamo).
 
 Design comune a entrambi i metodi (invariato):
   - ROI come ritaglio dell'immagine (FOV via intrinseci, altezza da
@@ -27,6 +27,19 @@ Design comune a entrambi i metodi (invariato):
     con gruppi di callback separati (client vs resto) per evitare deadlock.
   - TRACKING -> periodo di tolleranza a FRAME -> RECOVERY (timeout a
     TEMPO REALE) -> WAITING_TRIGGER se il target non si ritrova.
+
+LED di Spot (AudioVisualClient, SDK gRPC di Boston Dynamics):
+  - Gestiti da un THREAD DEDICATO (_led_worker), mai da _image_cb: le
+    chiamate gRPC al robot non devono aggiungere latenza alla percezione.
+  - Il software del robot 5.0.1 NON permette di creare behavior
+    personalizzati (AddOrModifyBehavior arriva nelle versioni successive):
+    ogni stato viene associato al NOME di un behavior gia' presente sul
+    robot (STATI_LED). Per elencarli: list_spot_led_behaviors.py.
+  - Al cambio di stato il behavior precedente viene fermato e il nuovo
+    avviato; ogni LED_REFRESH_SEC se ne estende la scadenza
+    (LED_DURATION_SEC): se il nodo muore, i LED tornano normali da soli.
+  - Se il sistema A/V non e' disponibile o nessuno stato ha un behavior,
+    i LED restano disattivati ma la FSM funziona normalmente.
 """
 
 import math
@@ -43,6 +56,10 @@ from cv_bridge import CvBridge
 from sensor_msgs.msg import Image, CompressedImage, CameraInfo
 from geometry_msgs.msg import PoseStamped
 from demo_interfaces.msg import TargetInfoMessage, TargetPose3D
+
+import bosdyn.client
+from bosdyn.api import audio_visual_pb2
+from bosdyn.client.audio_visual import AudioVisualClient
 
 from demo_package.common import (
     CameraIntrinsics, box_center, distance,
@@ -61,6 +78,26 @@ TRACKING = "tracking"
 RECOVERY = "recovery"
 
 # ============================================================
+# LED — per ogni stato della FSM, il NOME di un behavior A/V GIA' presente
+# sul robot (il software del robot 5.0.1 non permette di crearne di nuovi:
+# AddOrModifyBehavior esiste solo dalle versioni successive).
+# Per vedere i nomi disponibili, con colori e presenza di audio:
+#     python3 list_spot_led_behaviors.py
+# None = nessun behavior per quello stato (i LED tornano al comportamento
+# normale del robot). Evita behavior con AUDIO (lo script li segnala):
+# suonerebbero il buzzer a ogni cambio di stato.
+# ============================================================
+STATI_LED = {
+    INIT:            None,
+    WAITING_TRIGGER: None,                               # LED normali del robot
+    SEARCH:          "internal_autonomous_operation",    # bianco pulsante  (priorità 3)
+    TRACKING:        "internal_wait_for_entity",         # verde pulsante   (priorità 6)
+    RECOVERY:        "internal_autonomous_navigation",   # verde lampeggiante (priorità 4)
+}
+LED_DURATION_SEC = 5.0     # scadenza di ogni run_behavior (se il nodo muore, i LED si spengono da soli)
+LED_REFRESH_SEC = 2.0      # ogni quanto il worker rinnova il behavior (deve essere < LED_DURATION_SEC)
+
+# ============================================================
 # LO SWITCH — decide quale delle due architetture usare per l'intera
 # sessione. Cambia questo, ricompila, testa; per confrontare i due
 # metodi servono due sessioni separate, non uno switch a runtime.
@@ -76,39 +113,26 @@ HAND_CAMERA_INFO_TOPIC = '/camera/hand/camera_info'
 HAND_DEPTH_TOPIC = '/depth/hand/image'   # depth ToF della camera del braccio — verifica il nome reale
 GOAL_FRAME = 'odom'
 
-TARGET_POSE_TOPIC = 'target_info'  # suffisso _3d: convenzione demo_interfaces, stessa di /person_follow/target_info
+TARGET_POSE_TOPIC = 'target_info'
 
 DETECT_SERVICE = 'detect'
 TARGET_CLASSES = ['person']
 DEBUG_IMAGE_TOPIC = '/person_follow/hand_debug/compressed'  # suffisso /compressed: convenzione
                                                                # image_transport, stessa di /camera/hand/compressed
 
-REID_SIMILARITY_THRESHOLD = 0.60  # alzata da 0.5 — mitigazione parziale, non risolve da sola i casi
-                                    # di similarita' altissima per coincidenza (es. oggetti fuori
-                                    # distribuzione per il modello di ReID, vedi MIN_DETECTION_CONFIDENCE)
-MIN_DETECTION_CONFIDENCE = 0.10    # confidenza MINIMA della detection di YOLOE stessa (non l'aspetto)
-                                    # per essere considerato un candidato — filtro indipendente
-                                    # dall'aspetto, scarta classificazioni "person" incerte/al limite
+REID_SIMILARITY_THRESHOLD = 0.60  # soglia minima di similarita' per essere candidato
+MIN_DETECTION_CONFIDENCE = 0.10   # confidenza MINIMA della detection di YOLOE stessa (non l'aspetto)
 REID_EMA_ALPHA = 0.3
 TARGET_DISTANCE_THRESHOLD_FRAC = 0.30  # quanto puo' spostarsi (in pixel, come frazione della
-                                         # diagonale immagine) il target da un frame all'altro —
-                                         # oltre questa soglia, anche un aspetto simile viene scartato.
-STABILITY_FRAMES_REQUIRED = 10    # frame consecutivi "stabili" (significato diverso nei due
-                                    # metodi — vedi i rispettivi _handle_search_response_*)
-                                    # prima di agganciare in SEARCH
+                                         # diagonale immagine) il target da un frame all'altro
+STABILITY_FRAMES_REQUIRED = 10    # frame consecutivi "stabili" prima di agganciare in SEARCH
 TRACKING_GRACE_FRAMES = 30        # in TRACKING: frame di tentativo prima di passare a RECOVERY
 RECOVERY_TIMEOUT_SEC = 15.0       # in RECOVERY: secondi di tempo REALE prima di arrendersi
-REACQUISITION_STABILITY_FRAMES = 3   # quante volte di fila lo STESSO candidato deve risultare il
-                                       # migliore match prima di essere CONFERMATO come il target
-                                       # ritrovato (in TRACKING o RECOVERY) — un solo frame fortunato
-                                       # (un'altra persona che per un istante somiglia e sta nel posto
-                                       # giusto) non basta piu' a rubare l'identita' del target.
-REACQUISITION_PX_TOLERANCE = 60.0    # quanto puo' spostarsi tra un tentativo e l'altro per essere
-                                       # considerato "lo stesso candidato in corso di conferma"
+REACQUISITION_STABILITY_FRAMES = 3   # tentativi consecutivi per confermare un riaggancio
+REACQUISITION_PX_TOLERANCE = 60.0    # spostamento massimo tra tentativi per "stesso candidato"
 STOPPING_DISTANCE = 1.0
 
-
-REID_COMBINE = 0.40  # margine di vantaggio minimo (sopra la soglia REID_SIMILARITY_THRESHOLD)
+REID_COMBINE = 0.40  # soglia minima sul punteggio del VINCITORE (best_score)
 
 W_SIMILARITY = 0.7
 W_POSITION = 0.3
@@ -117,14 +141,42 @@ W_COSINE = 0.5
 W_EUCLIDEAN = 1.0
 W_MAGNITUDE = 0.8
 
-EUCLIDEAN_SCALE= 10.0
+EUCLIDEAN_SCALE = 10.0
 MAGNITUDE_SCALE = 10.0
 
 
 class TrackingFSM(Node):
-    def __init__(self):
+    def __init__(self, robot=None):
         super().__init__('tracking_fsm')
 
+        # ---------------- LED ----------------
+        self.robot = robot
+        self.audio_visual_client = None
+        if self.robot is not None:
+            try:
+                self.audio_visual_client = self.robot.ensure_client(AudioVisualClient.default_service_name)
+                self.get_logger().info("Client AudioVisual gRPC agganciato con successo.")
+            except Exception as ex:
+                self.get_logger().error(f"Impossibile creare AudioVisualClient: {ex} — LED disattivati.")
+                self.audio_visual_client = None
+
+        if self.audio_visual_client is not None and all(v is None for v in STATI_LED.values()):
+            self.get_logger().warn(
+                "[LED] nessun behavior associato agli stati in STATI_LED — lancia "
+                "list_spot_led_behaviors.py e compila il dizionario. LED disattivati.")
+            self.audio_visual_client = None
+
+        self._led_lock = threading.Lock()
+        self._led_desired_state = None
+        self._led_applied_name = None   # behavior attualmente in esecuzione sul robot
+        self._led_wake = threading.Event()
+        self._led_stop = threading.Event()
+        self._led_thread = None
+        if self.audio_visual_client is not None:
+            self._led_thread = threading.Thread(target=self._led_worker, daemon=True)
+            self._led_thread.start()
+
+        # ---------------- Percezione ----------------
         self.goal_frame = GOAL_FRAME
         self.fov_rad = math.radians(CONE_FOV_DEG)
         self.min_range = CONE_MIN_RANGE
@@ -135,7 +187,7 @@ class TrackingFSM(Node):
         self._hand_optical_frame = None
         self._latest_depth_image = None
         self._last_image_cb_time = None
-        
+
         self._last_response_time = None  # time.monotonic() dell'ultima risposta ricevuta dal servizio Detect
 
         # "Blocchiamo tutto": camera_info, depth e image sono nello stesso
@@ -153,7 +205,6 @@ class TrackingFSM(Node):
 
         self.state = INIT
         self.reference_embedding = None  # HSV in botsort_hsv, vettore neurale in embedding_only
-                                           # — mai entrambi insieme, il TIPO dipende da TRACKING_METHOD
         self.last_target_base = None
         self.last_published_pos = None
         self.last_published_time = 0.0
@@ -170,16 +221,15 @@ class TrackingFSM(Node):
         self._reacquisition_pending_box = None  # candidato in corso di conferma (vedi _confirm_reacquisition)
         self._reacquisition_count = 0
 
-        self._pending_tracker_reset = False  # SOLO botsort_hsv: True = la PROSSIMA chiamata
-                                               # chiede anche l'azzeramento del tracker BoT-SORT
+        self._pending_tracker_reset = False  # SOLO botsort_hsv
 
         self._start_trigger_thread()
-        
+
         sensor_qos_depth1 = QoSProfile(
-    reliability=ReliabilityPolicy.BEST_EFFORT,
-    history=HistoryPolicy.KEEP_LAST,
-    depth=1
-)
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+        )
 
         self.create_subscription(CameraInfo, HAND_CAMERA_INFO_TOPIC, self._camera_info_cb,
                                   qos_profile_sensor_data, callback_group=self._main_group)
@@ -189,45 +239,115 @@ class TrackingFSM(Node):
         hand_rgb_msg_type = CompressedImage if HAND_RGB_COMPRESSED else Image
         self.create_subscription(hand_rgb_msg_type, HAND_RGB_TOPIC, self._image_cb,
                                   sensor_qos_depth1, callback_group=self._main_group)
-        
-        self.target_pose_pub = self.create_publisher(TargetInfoMessage, TARGET_POSE_TOPIC, 1)
 
+        self.target_pose_pub = self.create_publisher(TargetInfoMessage, TARGET_POSE_TOPIC, 1)
         self.debug_pub = self.create_publisher(CompressedImage, DEBUG_IMAGE_TOPIC, 1)
-        
 
         self.get_logger().info(
             f"TrackingFSM avviato — METODO ATTIVO: {TRACKING_METHOD}. Stato iniziale: INIT. "
             f"ROI: FOV={math.degrees(self.fov_rad):.0f}° (crop larghezza), "
-            f"range=[{self.min_range:.2f},{self.max_range:.2f}]m (post-detection, via depth)")
+            f"range=[{self.min_range:.2f},{self.max_range:.2f}]m (post-detection, via depth). "
+            f"LED: {'ATTIVI' if self.audio_visual_client is not None else 'DISATTIVATI'}")
 
-    # ------------------------------------------------------------------
+        self._request_led_state(self.state)
+
+    # ==================================================================
+    # LED di Spot — thread dedicato, mai chiamate gRPC dentro _image_cb
+    # ==================================================================
+    def _request_led_state(self, state):
+        """Chiamata dalla FSM (costo nullo): registra lo stato desiderato e
+        sveglia il worker. Nessuna chiamata di rete qui."""
+        if self.audio_visual_client is None:
+            return
+        with self._led_lock:
+            if state == self._led_desired_state:
+                return
+            self._led_desired_state = state
+        self._led_wake.set()
+
+    def _led_worker(self):
+        """Lancia sul robot il behavior associato allo stato corrente e lo
+        rinnova periodicamente. Al cambio di stato ferma il behavior
+        precedente e avvia il nuovo."""
+        # run_behavior converte i tempi in tempo-robot: serve la time sync.
+        try:
+            self.robot.time_sync.wait_for_sync(timeout_sec=10.0)
+        except Exception as ex:
+            self.get_logger().error(f"[LED] time sync con il robot non stabilita: {ex} — LED disattivati.")
+            return
+
+        # Verifica una volta sola che i nomi configurati esistano sul robot.
+        try:
+            available = {live.name: live for live in self.audio_visual_client.list_behaviors()}
+        except Exception as ex:
+            self.get_logger().error(
+                f"[LED] list_behaviors fallita: {ex} — il robot ha il sistema A/V? LED disattivati.")
+            return
+        for state, name in STATI_LED.items():
+            if name is None:
+                continue
+            if name not in available:
+                self.get_logger().error(
+                    f"[LED] behavior {name!r} (stato {state.upper()}) NON presente sul robot. "
+                    f"Disponibili: {sorted(available)}")
+            elif available[name].behavior.audio_sequence_group.ListFields():
+                self.get_logger().warn(
+                    f"[LED] behavior {name!r} (stato {state.upper()}) contiene AUDIO: suonera' il buzzer.")
+
+        last_run = 0.0
+        while not self._led_stop.is_set():
+            self._led_wake.wait(timeout=LED_REFRESH_SEC)
+            self._led_wake.clear()
+            if self._led_stop.is_set():
+                break
+
+            with self._led_lock:
+                desired_state = self._led_desired_state
+            name = STATI_LED.get(desired_state)
+            if name is not None and name not in available:
+                name = None  # nome sbagliato: gia' segnalato all'avvio, non riproviamo ogni volta
+
+            now = time.time()
+            try:
+                if name != self._led_applied_name:
+                    if self._led_applied_name is not None:
+                        self.audio_visual_client.stop_behavior(self._led_applied_name)
+                    if name is not None:
+                        self.audio_visual_client.run_behavior(name, now + LED_DURATION_SEC, restart=True)
+                        last_run = now
+                    self._led_applied_name = name
+                    self.get_logger().info(f"[LED] stato {str(desired_state).upper()} -> behavior {name!r}")
+                elif name is not None and now - last_run >= LED_REFRESH_SEC:
+                    self.audio_visual_client.run_behavior(name, now + LED_DURATION_SEC, restart=False)
+                    last_run = now
+            except Exception as ex:
+                # _led_applied_name non aggiornato in caso di errore: al prossimo giro riprova.
+                self.get_logger().error(f"[LED] aggiornamento fallito: {ex}", throttle_duration_sec=5.0)
+
+    def shutdown_leds(self):
+        """Ferma il worker e il behavior in corso sul robot."""
+        self._led_stop.set()
+        self._led_wake.set()
+        if self._led_thread is not None:
+            self._led_thread.join(timeout=2.0)
+        if self.audio_visual_client is not None and self._led_applied_name is not None:
+            try:
+                self.audio_visual_client.stop_behavior(self._led_applied_name)
+            except Exception:
+                pass
+
+    # ==================================================================
     def _start_trigger_thread(self):
         """Avvia (o riavvia) il thread che aspetta INVIO. Un thread Python
         non e' riavviabile una volta terminato — per questo, ogni volta che
-        serve un nuovo trigger (il primo avvio, o il ritorno in
-        WAITING_TRIGGER da RECOVERY), se ne crea uno nuovo, non si riusa il
-        vecchio."""
+        serve un nuovo trigger se ne crea uno nuovo."""
         self._manual_trigger_received = False
         self._stdin_thread = threading.Thread(target=self._wait_for_manual_trigger, daemon=True)
         self._stdin_thread.start()
 
     def _enter_waiting_trigger(self):
         """Torna in WAITING_TRIGGER — chiamato quando RECOVERY scade senza
-        ritrovare il target. Richiede di premere di nuovo INVIO: dopo un
-        fallimento cosi' prolungato, decidere se/quando riprovare torna a
-        essere una scelta della persona, non un ciclo automatico.
-
-        NON azzera self.reference_embedding — e' voluto: e' la "memoria" di
-        chi stavamo seguendo, e la vogliamo usare per filtrare la PROSSIMA
-        SEARCH (vedi il controllo d'aspetto in _handle_search_response_*),
-        cosi' un oggetto qualsiasi (es. un altro robot classificato per
-        errore come "person") non venga agganciato solo perche' e' l'unico
-        presente — deve anche somigliare a chi avevamo gia' imparato a
-        riconoscere. Alla primissima ricerca in assoluto (mai stato
-        agganciato nulla prima), reference_embedding e' ancora None: in
-        quel caso specifico SEARCH non ha nulla con cui filtrare, e accetta
-        il primo candidato stabile — limite di partenza inevitabile senza
-        un passo di registrazione esplicito."""
+        ritrovare il target. Richiede di premere di nuovo INVIO."""
         self.state = WAITING_TRIGGER
         self._locked_box = None
         self._locked_track_id = -1
@@ -238,9 +358,7 @@ class TrackingFSM(Node):
         self._recovery_deadline = None
         self._reacquisition_pending_box = None
         self._reacquisition_count = 0
-        self._pending_tracker_reset = True  # innocuo se TRACKING_METHOD="embedding_only"
-                                               # (il campo semplicemente non viene guardato lato yolo
-                                               # se use_tracker=False)
+        self._pending_tracker_reset = True
         self._start_trigger_thread()
 
     def _wait_for_manual_trigger(self):
@@ -259,39 +377,46 @@ class TrackingFSM(Node):
 
     def _depth_cb(self, depth_msg):
         self._latest_depth_image = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding='passthrough')
-        
-        
+
     def _publish_target_info(self, box_full, dist, header):
-        """"Pubblica le informazioni del target (bounding box, distanza) in un messaggio."""
-        
+        """Pubblica le informazioni del target (bounding box, distanza)."""
+        if box_full is None or dist is None:
+            return  # nessun target valido: non pubblichiamo nulla
+
         if self._last_response_time is not None:
             elapsed_ms = (time.monotonic() - self._last_response_time) * 1000.0
             self.get_logger().warn(f"[tracking_fsm] round-trip (sincrono): {elapsed_ms:.0f} ms")
-        
+
         target_info_msg = TargetInfoMessage()
         target_info_msg.header = header
         target_info_msg.bounding_box = [float(v) for v in box_full]
         target_info_msg.depth_m = float(dist)
         target_info_msg.camera_rgb_topic = HAND_RGB_TOPIC
-
         target_info_msg.camera_depth_topic = HAND_DEPTH_TOPIC
 
         self.target_pose_pub.publish(target_info_msg)
-
 
     # ------------------------------------------------------------------
     # Dispatch per stato — il debug e' costruito e pubblicato SEMPRE
     # (tutti gli stati), la detection gira SOLO in SEARCH/TRACKING/RECOVERY.
     # ------------------------------------------------------------------
     def _image_cb(self, rgb_msg):
-        t_start = time.time()
-        
+        # Due orologi SEPARATI: time.time() solo per confrontarsi con lo
+        # stamp ROS (queue delay); time.monotonic() per tutti i timing interni.
+        t_wall = time.time()
+        t_start = time.monotonic()
+
         image_stamp = rgb_msg.header.stamp.sec + rgb_msg.header.stamp.nanosec * 1e-9
-        queue_delay_ms = (t_start - image_stamp) * 1000.0
-        self.get_logger().warn(f"[tracking_fsm] _image_cb: latenza tra cattura ed elaborazione: queue delay={queue_delay_ms:.0f}ms", throttle_duration_sec=1.0)
-        
+        queue_delay_ms = (t_wall - image_stamp) * 1000.0
+        self.get_logger().warn(
+            f"[tracking_fsm] _image_cb: latenza tra cattura ed elaborazione: queue delay={queue_delay_ms:.0f}ms",
+            throttle_duration_sec=1.0)
+
         since_last = (t_start - self._last_image_cb_time) * 1000.0 if self._last_image_cb_time else -1.0
         self._last_image_cb_time = t_start
+
+        # LED: registra solo lo stato desiderato (nessuna chiamata di rete qui).
+        self._request_led_state(self.state)
 
         if HAND_RGB_COMPRESSED:
             frame_bgr = self.bridge.compressed_imgmsg_to_cv2(rgb_msg, desired_encoding='bgr8')
@@ -356,7 +481,7 @@ class TrackingFSM(Node):
         reset_now = self._pending_tracker_reset
         self._pending_tracker_reset = False
         response = self.detect_client.call_sync(crop_msg, target_classes=TARGET_CLASSES, reset_tracker=reset_now)
-        
+
         self._last_response_time = time.monotonic()
 
         try:
@@ -378,6 +503,9 @@ class TrackingFSM(Node):
             self.get_logger().error(f"Eccezione nell'elaborazione della risposta: {ex}", throttle_duration_sec=2.0)
             self._publish_debug(debug_frame, rgb_msg.header)
 
+        # Stato eventualmente cambiato durante l'elaborazione: aggiorna subito i LED.
+        self._request_led_state(self.state)
+
     # ====================================================================
     # METODO "botsort_hsv" — identita' via track_id (BoT-SORT), HSV come
     # rete di sicurezza SOLO quando il track_id sparisce.
@@ -391,53 +519,41 @@ class TrackingFSM(Node):
         crop_x1, crop_y1, _, _ = crop_rect
         depth_image = self._latest_depth_image
 
-        valid_boxes = []  # (box_full, dist, track_id)
+        valid_boxes = []  # (box_full, dist, track_id, score)
         for det in response.detections:
             box_full = (det.x1 + crop_x1, det.y1 + crop_y1, det.x2 + crop_x1, det.y2 + crop_y1)
             self._draw_box(debug_frame, box_full, (100, 100, 100), f"{det.class_name} det pre CONFIDENCE check YOLOE SEARCH id {det.track_id}", label_offset=3)
-            
+
             if det.score < MIN_DETECTION_CONFIDENCE:
-                if debug_frame is not None:
-                    self._draw_box(debug_frame, box_full, (128, 0, 128),
-                                    f"{det.class_name} (confidenza {det.score:.2f} troppo bassa)", label_offset=2)
+                self._draw_box(debug_frame, box_full, (128, 0, 128),
+                                f"{det.class_name} (confidenza {det.score:.2f} troppo bassa)", label_offset=2)
                 continue
 
             if depth_image is None:
-                if debug_frame is not None:
-                    self._draw_box(debug_frame, box_full, (0, 255, 255), f"{det.class_name} (depth n/d)", label_offset=2)
+                self._draw_box(debug_frame, box_full, (0, 255, 255), f"{det.class_name} (depth n/d)", label_offset=2)
                 continue
             box_depth = scale_box_to_depth(box_full, frame_bgr.shape, depth_image.shape)
             dist = box_center_depth(depth_image, box_depth)
             if dist is None:
-                if debug_frame is not None:
-                    self._draw_box(debug_frame, box_full, (128, 128, 128), f"{det.class_name} (depth invalida)", label_offset=2)
+                self._draw_box(debug_frame, box_full, (128, 128, 128), f"{det.class_name} (depth invalida)", label_offset=2)
                 continue
             if not (self.min_range <= dist <= self.max_range):
-                if debug_frame is not None:
-                    self._draw_box(debug_frame, box_full, (0, 0, 220), f"{det.class_name} {dist:.2f}m (fuori range)", label_offset=2)
+                self._draw_box(debug_frame, box_full, (0, 0, 220), f"{det.class_name} {dist:.2f}m (fuori range)", label_offset=2)
                 continue
 
-            # Se conosciamo gia' l'aspetto del target (da una sessione
-            # precedente in questo stesso avvio del nodo — vedi la nota in
-            # _enter_waiting_trigger), un candidato che non gli somiglia
-            # NON diventa un box valido, anche se e' l'unico presente e
-            # classificato "person". Alla primissima ricerca in assoluto
-            # (reference_embedding ancora None) questo filtro non si applica.
             if self.reference_embedding is not None:
                 candidate_hsv = extract_appearance_embedding(frame_bgr, box_full)
                 sim = embedding_similarity(candidate_hsv, self.reference_embedding)
                 if sim < REID_SIMILARITY_THRESHOLD:
-                    if debug_frame is not None:
-                        self._draw_box(debug_frame, box_full, (255, 0, 255),
-                                        f"{det.class_name} {dist:.2f}m (non e' il target noto, sim={sim:.2f})", label_offset=2)
+                    self._draw_box(debug_frame, box_full, (255, 0, 255),
+                                    f"{det.class_name} {dist:.2f}m (non e' il target noto, sim={sim:.2f})", label_offset=2)
                     continue
 
             valid_boxes.append((box_full, dist, det.track_id, det.score))
 
         if len(valid_boxes) != 1:
-            if debug_frame is not None:
-                for box_full, dist, _track_id, score in valid_boxes:
-                    self._draw_box(debug_frame, box_full, (0, 200, 0), f"person {dist:.2f}m score={score:.2f}", label_offset=2)
+            for box_full, dist, _track_id, score in valid_boxes:
+                self._draw_box(debug_frame, box_full, (0, 200, 0), f"person {dist:.2f}m score={score:.2f}", label_offset=2)
             self.get_logger().info(
                 f"SEARCH [botsort_hsv] in attesa: {len(valid_boxes)} box nel raggio d'azione su "
                 f"{len(response.detections)} rilevati (serve esattamente 1).", throttle_duration_sec=2.0)
@@ -448,10 +564,6 @@ class TrackingFSM(Node):
 
         box_full, dist, track_id, score = valid_boxes[0]
 
-        # Stabilita' basata SOLO sul track_id di BoT-SORT — se resta lo
-        # stesso numero per N frame di fila, ci fidiamo. track_id=-1 (non
-        # ancora agganciato da BoT-SORT) azzera il contatore: nessun segnale
-        # affidabile su cui confermare continuita'.
         if track_id != -1 and track_id == self._stability_track_id:
             self._stability_count += 1
         elif track_id != -1:
@@ -466,15 +578,12 @@ class TrackingFSM(Node):
             f"stabilita' {self._stability_count}/{STABILITY_FRAMES_REQUIRED}", throttle_duration_sec=1.0)
 
         if self._stability_count < STABILITY_FRAMES_REQUIRED:
-            if debug_frame is not None:
-                label = (f"person {dist:.2f}m score={score:.2f} ({self._stability_count}/{STABILITY_FRAMES_REQUIRED})"
-                         if track_id != -1 else f"person {dist:.2f}m score={score:.2f} (non ancora tracciato da BoT-SORT) id={track_id}")
-                self._draw_box(debug_frame, box_full, (0, 200, 0), label, label_offset=0)
+            label = (f"person {dist:.2f}m score={score:.2f} ({self._stability_count}/{STABILITY_FRAMES_REQUIRED})"
+                     if track_id != -1 else f"person {dist:.2f}m score={score:.2f} (non ancora tracciato da BoT-SORT) id={track_id}")
+            self._draw_box(debug_frame, box_full, (0, 200, 0), label, label_offset=0)
             self._publish_debug(debug_frame, header)
             return
 
-        # Stabile per abbastanza frame (secondo BoT-SORT): aggancio.
-        # Il riferimento HSV si calcola in locale, ORA, una volta sola.
         self.reference_embedding = extract_appearance_embedding(frame_bgr, box_full)
         self._locked_box = box_full
         self._locked_track_id = track_id
@@ -483,14 +592,11 @@ class TrackingFSM(Node):
         self._stability_track_id = -1
         self.get_logger().info(
             f"[botsort_hsv] Target agganciato a {dist:.2f}m (track_id={track_id}) — passo a TRACKING.")
-        if debug_frame is not None:
-            self._draw_box(debug_frame, box_full, (0, 255, 0), f"TARGET {dist:.2f}m id={track_id}" , label_offset=0)
+        self._draw_box(debug_frame, box_full, (0, 255, 0), f"TARGET {dist:.2f}m id={track_id}", label_offset=0)
         self._publish_debug(debug_frame, header)
 
     def _attempt_reacquisition_botsort(self, response, frame_bgr, crop_rect, depth_image, debug_frame):
-        """SOLO istogramma HSV (mai neurale) — usata dal periodo di
-        tolleranza in TRACKING e da RECOVERY, quando il track_id agganciato
-        e' sparito dalle detection."""
+        """SOLO istogramma HSV (mai neurale)."""
         if response is None:
             return None, -1, None, None
 
@@ -504,7 +610,7 @@ class TrackingFSM(Node):
 
         for det in response.detections:
             box_full = (det.x1 + crop_x1, det.y1 + crop_y1, det.x2 + crop_x1, det.y2 + crop_y1)
-            self._draw_box(debug_frame, box_full, (200, 100, 100), f"{det.class_name} det pre_CONFIDENCE BOTSORT_TRACKING/RECOVERY id {det.track_id}" , label_offset=3)
+            self._draw_box(debug_frame, box_full, (200, 100, 100), f"{det.class_name} det pre_CONFIDENCE BOTSORT_TRACKING/RECOVERY id {det.track_id}", label_offset=3)
 
             if det.score < MIN_DETECTION_CONFIDENCE:
                 continue
@@ -525,7 +631,7 @@ class TrackingFSM(Node):
             if dist_px > target_threshold_px:
                 continue
 
-            combined = (W_SIMILARITY * similarity) - (W_POSITION * ( dist_px / target_threshold_px))
+            combined = (W_SIMILARITY * similarity) - (W_POSITION * (dist_px / target_threshold_px))
             if combined > best_combined:
                 best_combined = combined
                 best_box, best_dist_m, best_score, best_track_id = box_full, dist_m, similarity, det.track_id
@@ -534,16 +640,17 @@ class TrackingFSM(Node):
 
     def _handle_track_response_botsort(self, response, frame_bgr, crop_rect, debug_frame, header):
         depth_image = self._latest_depth_image
-        
-        for det in response.detections:
-            box_full = (det.x1 + crop_rect[0], det.y1 + crop_rect[1],
-                        det.x2 + crop_rect[0], det.y2 + crop_rect[1])
-            self._draw_box(debug_frame, box_full, (100, 100, 100), f"{det.class_name} det pre CONFIDENCE check BOTSORT_TRACKING id {det.track_id}", label_offset=3)
 
-        # ---- PERCORSO VELOCE: il track_id agganciato e' ancora tra le detection? ----
+        if response is not None:
+            for det in response.detections:
+                box_full = (det.x1 + crop_rect[0], det.y1 + crop_rect[1],
+                            det.x2 + crop_rect[0], det.y2 + crop_rect[1])
+                self._draw_box(debug_frame, box_full, (100, 100, 100), f"{det.class_name} det pre CONFIDENCE check BOTSORT_TRACKING id {det.track_id}", label_offset=3)
+
+        # ---- PERCORSO VELOCE ----
         fast_det = None
+        crop_x1, crop_y1, _, _ = crop_rect
         if response is not None and self._locked_track_id != -1:
-            crop_x1, crop_y1, _, _ = crop_rect
             for det in response.detections:
                 if det.track_id == self._locked_track_id:
                     fast_det = det
@@ -560,27 +667,17 @@ class TrackingFSM(Node):
 
             self._locked_box = box_full
             self._tracking_miss_count = 0
-            self._reset_reacquisition_confirmation()  # sul percorso veloce, nessuna conferma pendente ha senso
+            self._reset_reacquisition_confirmation()
 
             if in_range:
                 new_hsv = extract_appearance_embedding(frame_bgr, box_full)
                 if new_hsv is not None and self.reference_embedding is not None:
                     self.reference_embedding = (
                         (1 - REID_EMA_ALPHA) * self.reference_embedding + REID_EMA_ALPHA * new_hsv)
-                if debug_frame is not None:
-                    # self._draw_box(debug_frame, box_full, (0, 255, 0),
-                    #                 f"TARGET {dist_m:.2f}m id={self._locked_track_id}", label_offset=0)
-                    pass
                 self.get_logger().info(
                     f"TRACKING [botsort_hsv] ok (track_id={self._locked_track_id}): confermato a {dist_m:.2f}m",
                     throttle_duration_sec=1.0)
             else:
-                # Fuori range ma il track_id e' ancora quello giusto: NON lo
-                # contiamo come perso — restiamo agganciati, aspettiamo che rientri.
-                if debug_frame is not None:
-                    suffix = "(fuori range)" if dist_m is not None else "(depth n/d)"
-                    # self._draw_box(debug_frame, box_full, (0, 200, 255),
-                    #                 f"TARGET id={self._locked_track_id} {suffix}", label_offset=1)
                 self.get_logger().info(
                     f"TRACKING [botsort_hsv]: track_id={self._locked_track_id} presente ma fuori range "
                     f"— resto agganciato, non conto come perso.", throttle_duration_sec=1.0)
@@ -588,28 +685,21 @@ class TrackingFSM(Node):
             self._publish_debug(debug_frame, header)
             return
 
-        # ---- Il track_id agganciato NON c'e': tentativo con HSV, ancora in TRACKING ----
-        # Un candidato trovato NON viene adottato subito — deve essere il
-        # migliore match per REACQUISITION_STABILITY_FRAMES tentativi di
-        # fila (vedi _confirm_reacquisition): un solo frame fortunato (es.
-        # un'altra persona che per un istante somiglia e sta nel posto
-        # giusto) non deve poter rubare l'identita' del target.
+        # ---- Il track_id agganciato NON c'e': tentativo con HSV ----
         best_box, best_track_id, best_dist_m, best_score = self._attempt_reacquisition_botsort(
             response, frame_bgr, crop_rect, depth_image, debug_frame)
-        
+
         if best_box is not None and best_score < REID_COMBINE:
-            best_box = None  # scarta il candidato se la somiglianza e' troppo vicina alla soglia minima
-            
+            best_box = None
 
         committed = False
         if best_box is not None:
             if self._confirm_reacquisition(best_box):
                 committed = True
             else:
-                if debug_frame is not None:
-                    self._draw_box(debug_frame, best_box, (255, 165, 0),
-                                    f"possibile target {best_dist_m:.2f}m "
-                                    f"(conferma {self._reacquisition_count}/{REACQUISITION_STABILITY_FRAMES})" , label_offset=2)
+                self._draw_box(debug_frame, best_box, (255, 165, 0),
+                                f"possibile target {best_dist_m:.2f}m "
+                                f"(conferma {self._reacquisition_count}/{REACQUISITION_STABILITY_FRAMES})", label_offset=2)
                 self.get_logger().info(
                     f"TRACKING [botsort_hsv]: candidato trovato, in attesa di conferma "
                     f"({self._reacquisition_count}/{REACQUISITION_STABILITY_FRAMES})...", throttle_duration_sec=1.0)
@@ -617,11 +707,10 @@ class TrackingFSM(Node):
             self._reset_reacquisition_confirmation()
 
         if committed:
-            if debug_frame is not None:
-                self._draw_box(debug_frame, best_box, (0, 255, 0), f"TARGET {best_dist_m:.2f}m id={best_track_id}", label_offset=0)
+            self._draw_box(debug_frame, best_box, (0, 255, 0), f"TARGET {best_dist_m:.2f}m id={best_track_id}", label_offset=0)
             old_track_id = self._locked_track_id
             self._locked_box = best_box
-            self._locked_track_id = best_track_id  # ADOTTIAMO il nuovo track_id
+            self._locked_track_id = best_track_id
             self._tracking_miss_count = 0
             new_hsv = extract_appearance_embedding(frame_bgr, best_box)
             if new_hsv is not None and self.reference_embedding is not None:
@@ -633,9 +722,6 @@ class TrackingFSM(Node):
             self._publish_debug(debug_frame, header)
             return
 
-        # Nessuna corrispondenza confermata questo frame: avanza il
-        # contatore di tolleranza — sia che non ci fosse nessun candidato,
-        # sia che ce ne fosse uno ancora in attesa di conferma.
         self._tracking_miss_count += 1
         if self._tracking_miss_count < TRACKING_GRACE_FRAMES:
             self.get_logger().info(
@@ -657,25 +743,23 @@ class TrackingFSM(Node):
         depth_image = self._latest_depth_image
         best_box, best_track_id, best_dist_m, best_score = self._attempt_reacquisition_botsort(
             response, frame_bgr, crop_rect, depth_image, debug_frame)
-        
+
         if best_box is not None and best_score < REID_COMBINE:
-            best_box = None  # scarta il candidato se la somiglianza e' troppo vicina alla soglia minima
+            best_box = None
 
         committed = False
         if best_box is not None:
             if self._confirm_reacquisition(best_box):
                 committed = True
             else:
-                if debug_frame is not None:
-                    self._draw_box(debug_frame, best_box, (255, 165, 0),
-                                    f"possibile target {best_dist_m:.2f}m "
-                                    f"(conferma {self._reacquisition_count}/{REACQUISITION_STABILITY_FRAMES})", label_offset=2)
+                self._draw_box(debug_frame, best_box, (255, 165, 0),
+                                f"possibile target {best_dist_m:.2f}m "
+                                f"(conferma {self._reacquisition_count}/{REACQUISITION_STABILITY_FRAMES})", label_offset=2)
         else:
             self._reset_reacquisition_confirmation()
 
         if committed:
-            if debug_frame is not None:
-                self._draw_box(debug_frame, best_box, (0, 255, 0), f"TARGET {best_dist_m:.2f}m id={best_track_id}", label_offset=0)
+            self._draw_box(debug_frame, best_box, (0, 255, 0), f"TARGET {best_dist_m:.2f}m id={best_track_id}", label_offset=0)
             old_track_id = self._locked_track_id
             self._locked_box = best_box
             self._locked_track_id = best_track_id
@@ -710,7 +794,7 @@ class TrackingFSM(Node):
     # ====================================================================
 
     def _handle_search_response_embedding(self, response, frame_bgr, crop_rect, debug_frame, header):
-        
+
         self.reference_embedding = None  # in SEARCH non ci fidiamo di nessun embedding precedente — serve un candidato stabile nuovo
         if response is None:
             self._publish_debug(debug_frame, header)
@@ -719,7 +803,7 @@ class TrackingFSM(Node):
         crop_x1, crop_y1, _, _ = crop_rect
         depth_image = self._latest_depth_image
 
-        valid_boxes = []  # (box_full, dist, embedding)
+        valid_boxes = []  # (box_full, dist, embedding, score)
         for det in response.detections:
             box_full = (det.x1 + crop_x1, det.y1 + crop_y1, det.x2 + crop_x1, det.y2 + crop_y1)
             self._draw_box(debug_frame, box_full, (100, 100, 100), f"{det.class_name} det pre MIN_DETECTION_CONFIDENCE check EMBEDDING_ONLY SEARCH", label_offset=3)
@@ -727,45 +811,33 @@ class TrackingFSM(Node):
             if det.score < MIN_DETECTION_CONFIDENCE:
                 continue
             if depth_image is None:
-                if debug_frame is not None:
-                    self._draw_box(debug_frame, box_full, (0, 255, 255), f"{det.class_name} (depth n/d)", label_offset=0)
+                self._draw_box(debug_frame, box_full, (0, 255, 255), f"{det.class_name} (depth n/d)", label_offset=0)
                 continue
             box_depth = scale_box_to_depth(box_full, frame_bgr.shape, depth_image.shape)
             dist = box_center_depth(depth_image, box_depth)
             if dist is None:
-                if debug_frame is not None:
-                    self._draw_box(debug_frame, box_full, (128, 128, 128), f"{det.class_name} (depth invalida)", label_offset=0)
+                self._draw_box(debug_frame, box_full, (128, 128, 128), f"{det.class_name} (depth invalida)", label_offset=0)
                 continue
             if not (self.min_range <= dist <= self.max_range):
-                if debug_frame is not None:
-                    self._draw_box(debug_frame, box_full, (0, 0, 220), f"{det.class_name} {dist:.2f}m (fuori range)", label_offset=0   )
+                self._draw_box(debug_frame, box_full, (0, 0, 220), f"{det.class_name} {dist:.2f}m (fuori range)", label_offset=0)
                 continue
 
             candidate_embedding = embedding_from_msg(det.embedding)
-            self._draw_box(debug_frame, box_full, (0, 255, 0), f"{det.class_name} {dist:.2f}m (embedding: {candidate_embedding[:5]})", label_offset=1)
-            
+            emb_preview = candidate_embedding[:5] if candidate_embedding is not None else "n/d"
+            self._draw_box(debug_frame, box_full, (0, 255, 0), f"{det.class_name} {dist:.2f}m (embedding: {emb_preview})", label_offset=1)
 
-            # Stesso filtro del metodo botsort_hsv (vedi la nota gemella
-            # li'), qui con l'embedding neurale invece dell'HSV — se
-            # conosciamo gia' l'aspetto del target da una sessione
-            # precedente, un candidato che non gli somiglia non diventa un
-            # box valido.
             if self.reference_embedding is not None:
-                
-                sim = rich_neural_embedding_similarity(candidate_embedding, self.reference_embedding , w_cosine=W_COSINE, w_euclidean=W_EUCLIDEAN, w_magnitude=W_MAGNITUDE, euclidean_scale=EUCLIDEAN_SCALE, magnitude_scale=MAGNITUDE_SCALE)
-                
+                sim = rich_neural_embedding_similarity(candidate_embedding, self.reference_embedding, w_cosine=W_COSINE, w_euclidean=W_EUCLIDEAN, w_magnitude=W_MAGNITUDE, euclidean_scale=EUCLIDEAN_SCALE, magnitude_scale=MAGNITUDE_SCALE)
                 if sim < REID_SIMILARITY_THRESHOLD:
-                    if debug_frame is not None:
-                        self._draw_box(debug_frame, box_full, (255, 0, 255),
-                                        f"{det.class_name} {dist:.2f}m (non e' il target noto, sim={sim:.2f})", label_offset=1)
+                    self._draw_box(debug_frame, box_full, (255, 0, 255),
+                                    f"{det.class_name} {dist:.2f}m (non e' il target noto, sim={sim:.2f})", label_offset=1)
                     continue
 
             valid_boxes.append((box_full, dist, candidate_embedding, det.score))
-        
+
         if len(valid_boxes) != 1:
-            if debug_frame is not None:
-                for box_full, dist, _emb, score in valid_boxes:
-                    self._draw_box(debug_frame, box_full, (0, 200, 0), f"person {dist:.2f}m score={score:.2f}", label_offset=1)
+            for box_full, dist, _emb, score in valid_boxes:
+                self._draw_box(debug_frame, box_full, (0, 200, 0), f"person {dist:.2f}m score={score:.2f}", label_offset=1)
             self.get_logger().info(
                 f"SEARCH [embedding_only] in attesa: {len(valid_boxes)} box nel raggio d'azione su "
                 f"{len(response.detections)} rilevati (serve esattamente 1).", throttle_duration_sec=2.0)
@@ -778,17 +850,14 @@ class TrackingFSM(Node):
 
         if box_embedding is None:
             self.get_logger().warn(
-                "SEARCH [embedding_only]: nessun embedding ricevuto — il DetectorNode ha "
-                "embedding_model_path configurato? Senza embedding non posso confermare stabilita' "
-                "in questo metodo.", throttle_duration_sec=2.0)
+                "SEARCH [embedding_only]: nessun embedding ricevuto — il DetectorNode ha il modello "
+                "di ReID configurato? Senza embedding non posso confermare stabilita'.",
+                throttle_duration_sec=2.0)
             self._stability_count = 0
             self._stability_reference_embedding = None
             self._publish_debug(debug_frame, header)
             return
 
-        # Stabilita' basata sulla continuita' D'ASPETTO frame-su-frame — non
-        # su un track_id (che qui non usiamo mai): l'embedding di questo box
-        # deve restare simile a quello del frame PRECEDENTE per N frame di fila.
         if self._stability_reference_embedding is not None:
             sim = neural_embedding_similarity(box_embedding, self._stability_reference_embedding)
             if sim >= REID_SIMILARITY_THRESHOLD:
@@ -797,7 +866,7 @@ class TrackingFSM(Node):
                 self._stability_count = 1
         else:
             self._stability_count = 1
-        self._stability_reference_embedding = box_embedding  # confronto SEMPRE col frame appena visto
+        self._stability_reference_embedding = box_embedding
 
         self.get_logger().info(
             f"SEARCH [embedding_only]: 1 box nel raggio a {dist:.2f}m (score={score:.2f}) — "
@@ -805,9 +874,8 @@ class TrackingFSM(Node):
             throttle_duration_sec=1.0)
 
         if self._stability_count < STABILITY_FRAMES_REQUIRED:
-            if debug_frame is not None:
-                self._draw_box(debug_frame, box_full, (0, 200, 0),
-                                f"person {dist:.2f}m score={score:.2f} ({self._stability_count}/{STABILITY_FRAMES_REQUIRED})", label_offset=1)
+            self._draw_box(debug_frame, box_full, (0, 200, 0),
+                            f"person {dist:.2f}m score={score:.2f} ({self._stability_count}/{STABILITY_FRAMES_REQUIRED})", label_offset=1)
             self._publish_debug(debug_frame, header)
             return
 
@@ -819,15 +887,12 @@ class TrackingFSM(Node):
         self._stability_count = 0
         self._stability_reference_embedding = None
         self.get_logger().info(f"[embedding_only] Target agganciato a {dist:.2f}m — passo a TRACKING.")
-        if debug_frame is not None:
-            self._draw_box(debug_frame, box_full, (0, 255, 0), f"TARGET {dist:.2f}m", label_offset=0)
+        self._draw_box(debug_frame, box_full, (0, 255, 0), f"TARGET {dist:.2f}m", label_offset=0)
         self._publish_debug(debug_frame, header)
 
     def _attempt_reacquisition_embedding(self, response, frame_bgr, crop_rect, depth_image, debug_frame):
-        """SOLO embedding neurale (mai HSV, mai track_id) — chiamata ad
-        OGNI frame in TRACKING (qui non esiste un 'percorso veloce' via
-        track_id: ogni frame e' gia' un tentativo di riconoscimento pieno)
-        e in RECOVERY."""
+        """SOLO embedding neurale (mai HSV, mai track_id). best_score
+        ritornato = punteggio COMBINATO (confrontato poi con REID_COMBINE)."""
         if response is None:
             return None, None, None, None
 
@@ -852,11 +917,9 @@ class TrackingFSM(Node):
                 continue
 
             b_embedding = embedding_from_msg(det.embedding)
-            
-            # self._draw_box(debug_frame, box_full, (100, 100, 100), f"")
-            
+
             similarity = rich_neural_embedding_similarity(b_embedding, self.reference_embedding, w_cosine=W_COSINE, w_euclidean=W_EUCLIDEAN, w_magnitude=W_MAGNITUDE, euclidean_scale=EUCLIDEAN_SCALE, magnitude_scale=MAGNITUDE_SCALE)
-                          
+
             if similarity < REID_SIMILARITY_THRESHOLD:
                 continue
 
@@ -865,11 +928,11 @@ class TrackingFSM(Node):
                 continue
 
             combined = (W_SIMILARITY * similarity) - (W_POSITION * (dist_px / target_threshold_px))
-            
+
             self.get_logger().info(f"Similarity: {similarity:.2f}, Distance: {dist_px:.2f}px, Combined: {combined:.2f}", throttle_duration_sec=1.0)
-            
+
             self._draw_box(debug_frame, box_full, (0, 200, 0), f"person {dist_m:.2f}m score={det.score:.2f} sim={similarity:.2f} comb={combined:.2f}", label_offset=4)
-            
+
             if combined > best_combined:
                 best_combined = combined
                 best_box, best_dist_m, best_score, best_embedding = box_full, dist_m, best_combined, b_embedding
@@ -877,26 +940,19 @@ class TrackingFSM(Node):
         return best_box, best_dist_m, best_score, best_embedding
 
     def _handle_track_response_embedding(self, response, frame_bgr, crop_rect, debug_frame, header):
-        # Nessun percorso veloce qui: senza track_id, OGNI frame e' un
-        # tentativo di riconoscimento pieno (aspetto+posizione+distanza).
-        # La conferma su piu' tentativi (vedi _confirm_reacquisition) scatta
-        # SOLO se il frame precedente era gia' un "miss" — durante il
-        # tracciamento continuo e senza interruzioni, la continuita' di
-        # posizione+distanza frame-su-frame e' gia' una protezione
-        # sufficiente, non serve rallentare anche quel caso.
         was_continuous = (self._tracking_miss_count == 0)
         depth_image = self._latest_depth_image
-        
-        
-        for det in response.detections:
-            box_full = (det.x1 + crop_rect[0], det.y1 + crop_rect[1], det.x2 + crop_rect[0], det.y2 + crop_rect[1])
-            self._draw_box(debug_frame, box_full, (100, 100, 100), f"{det.class_name} - {det.score:.2f}", label_offset=3)
-        
+
+        if response is not None:
+            for det in response.detections:
+                box_full = (det.x1 + crop_rect[0], det.y1 + crop_rect[1], det.x2 + crop_rect[0], det.y2 + crop_rect[1])
+                self._draw_box(debug_frame, box_full, (100, 100, 100), f"{det.class_name} - {det.score:.2f}", label_offset=3)
+
         best_box, best_dist_m, best_score, best_embedding = self._attempt_reacquisition_embedding(
             response, frame_bgr, crop_rect, depth_image, debug_frame)
-        
-        if best_box is not None and best_score <  REID_COMBINE :
-            best_box = None  # non e' abbastanza simile da essere considerato un match valido
+
+        if best_box is not None and best_score < REID_COMBINE:
+            best_box = None
 
         committed = False
         if best_box is not None:
@@ -906,21 +962,17 @@ class TrackingFSM(Node):
             elif self._confirm_reacquisition(best_box):
                 committed = True
             else:
-                if debug_frame is not None:
-                    self._draw_box(debug_frame, best_box, (255, 165, 0),
-                                    f"possibile target {best_dist_m:.2f}m "
-                                    f"(conferma {self._reacquisition_count}/{REACQUISITION_STABILITY_FRAMES})" , label_offset=2)
+                self._draw_box(debug_frame, best_box, (255, 165, 0),
+                                f"possibile target {best_dist_m:.2f}m "
+                                f"(conferma {self._reacquisition_count}/{REACQUISITION_STABILITY_FRAMES})", label_offset=2)
                 self.get_logger().info(
                     f"TRACKING [embedding_only]: candidato trovato, in attesa di conferma "
                     f"({self._reacquisition_count}/{REACQUISITION_STABILITY_FRAMES})...", throttle_duration_sec=1.0)
         else:
             self._reset_reacquisition_confirmation()
-            
-        
 
         if committed:
-            if debug_frame is not None:
-                self._draw_box(debug_frame, best_box, (0, 255, 0), f"TARGET {best_dist_m:.2f}m", label_offset=0)
+            self._draw_box(debug_frame, best_box, (0, 255, 0), f"TARGET {best_dist_m:.2f}m", label_offset=0)
             self._locked_box = best_box
             self._tracking_miss_count = 0
             self._publish_target_info(best_box, best_dist_m, header)
@@ -928,7 +980,7 @@ class TrackingFSM(Node):
                 self.reference_embedding = (
                     (1 - REID_EMA_ALPHA) * self.reference_embedding + REID_EMA_ALPHA * best_embedding)
             self.get_logger().info(
-                f"TRACKING [embedding_only] ok: confermato a {best_dist_m:.2f}m, similarity={best_score:.2f}",
+                f"TRACKING [embedding_only] ok: confermato a {best_dist_m:.2f}m, combinato={best_score:.2f}",
                 throttle_duration_sec=1.0)
             self._publish_debug(debug_frame, header)
             return
@@ -941,8 +993,7 @@ class TrackingFSM(Node):
                 throttle_duration_sec=1.0)
             self._publish_debug(debug_frame, header)
             return
-        
-        
+
         self.state = RECOVERY
         self._recovery_deadline = time.monotonic() + RECOVERY_TIMEOUT_SEC
         self._tracking_miss_count = 0
@@ -952,37 +1003,32 @@ class TrackingFSM(Node):
         self._publish_debug(debug_frame, header)
 
     def _handle_recovery_response_embedding(self, response, frame_bgr, crop_rect, debug_frame, header):
-        
-        
-        for det in response.detections:
-            box_full = (det.x1 + crop_rect[0], det.y1 + crop_rect[1], det.x2 + crop_rect[0], det.y2 + crop_rect[1])
-            self._draw_box(debug_frame, box_full, (100, 100, 100), f"{det.class_name} det pre MIN_DETECTION_CONFIDENCE check EMBEDDING_ONLY RECOVERY", label_offset=3)
-        
+
+        if response is not None:
+            for det in response.detections:
+                box_full = (det.x1 + crop_rect[0], det.y1 + crop_rect[1], det.x2 + crop_rect[0], det.y2 + crop_rect[1])
+                self._draw_box(debug_frame, box_full, (100, 100, 100), f"{det.class_name} det pre MIN_DETECTION_CONFIDENCE check EMBEDDING_ONLY RECOVERY", label_offset=3)
+
         depth_image = self._latest_depth_image
         best_box, best_dist_m, best_score, best_embedding = self._attempt_reacquisition_embedding(
             response, frame_bgr, crop_rect, depth_image, debug_frame)
-        
-        
-        if best_box is not None and best_score < REID_COMBINE :
-            best_box = None  # non e' abbastanza simile da essere considerato un match valido
+
+        if best_box is not None and best_score < REID_COMBINE:
+            best_box = None
 
         committed = False
         if best_box is not None:
             if self._confirm_reacquisition(best_box):
                 committed = True
             else:
-                if debug_frame is not None:
-                    self._draw_box(debug_frame, best_box, (255, 165, 0),
-                                    f"possibile target {best_dist_m:.2f}m "
-                                    f"(conferma {self._reacquisition_count}/{REACQUISITION_STABILITY_FRAMES})", label_offset=2)
+                self._draw_box(debug_frame, best_box, (255, 165, 0),
+                                f"possibile target {best_dist_m:.2f}m "
+                                f"(conferma {self._reacquisition_count}/{REACQUISITION_STABILITY_FRAMES})", label_offset=2)
         else:
             self._reset_reacquisition_confirmation()
-            
-        
 
         if committed:
-            if debug_frame is not None:
-                self._draw_box(debug_frame, best_box, (0, 255, 0), f"TARGET {best_dist_m:.2f}m", label_offset=0)
+            self._draw_box(debug_frame, best_box, (0, 255, 0), f"TARGET {best_dist_m:.2f}m", label_offset=0)
             self._locked_box = best_box
             self.state = TRACKING
             self._tracking_miss_count = 0
@@ -993,10 +1039,9 @@ class TrackingFSM(Node):
                     (1 - REID_EMA_ALPHA) * self.reference_embedding + REID_EMA_ALPHA * best_embedding)
             self.get_logger().info(
                 f"RECOVERY [embedding_only]: target CONFERMATO a {best_dist_m:.2f}m, "
-                f"similarity={best_score:.2f} — torno a TRACKING.")
+                f"combinato={best_score:.2f} — torno a TRACKING.")
             self._publish_debug(debug_frame, header)
             return
-        
 
         remaining = self._recovery_deadline - time.monotonic()
         if remaining <= 0:
@@ -1014,15 +1059,9 @@ class TrackingFSM(Node):
     # Comune a entrambi i metodi
     # ------------------------------------------------------------------
     def _confirm_reacquisition(self, candidate_box):
-        """Richiede che lo STESSO candidato (per posizione) sia il
-        migliore match per REACQUISITION_STABILITY_FRAMES tentativi di
-        fila prima di essere confermato come il target ritrovato — un solo
-        frame fortunato (es. un passante che per un istante somiglia al
-        target ed e' nel punto giusto) non basta piu' a rubargli
-        l'identita'. Ritorna True quando la conferma e' raggiunta (e
-        azzera il contatore per la prossima volta), False se serve ancora
-        attesa — in quel caso il chiamante NON deve ancora agganciare
-        nulla, solo continuare a provare al frame successivo."""
+        """Lo STESSO candidato (per posizione) deve essere il migliore
+        match per REACQUISITION_STABILITY_FRAMES tentativi di fila prima di
+        essere confermato come il target ritrovato."""
         candidate_center = box_center(candidate_box)
         if (self._reacquisition_pending_box is not None
                 and distance(candidate_center, box_center(self._reacquisition_pending_box))
@@ -1044,24 +1083,26 @@ class TrackingFSM(Node):
 
     @staticmethod
     def _draw_box(frame, box, color, label, label_offset=0):
+        # Senza nessuno iscritto al topic di debug il frame e' None: niente
+        # da disegnare. Senza questo controllo, chiudere rqt faceva
+        # eccezione a ogni frame e bloccava il tracking.
+        if frame is None or box is None:
+            return
         x1, y1, x2, y2 = [int(v) for v in box]
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
         font = cv2.FONT_HERSHEY_SIMPLEX
         font_scale = 0.5
         thickness = 2
-        
-        (text_w,text_h), _ = cv2.getTextSize(label, font, font_scale, thickness)
-        
+
+        (text_w, text_h), _ = cv2.getTextSize(label, font, font_scale, thickness)
         h_img, w_img = frame.shape[:2]
-        
-        text_x = min(x1, max(0, w_img - text_w -4))  # 4 pixel di margine a destra
-        line_height = text_h + 10  # 2 pixel di margine sopra e sotto
-        
+
+        text_x = min(x1, max(0, w_img - text_w - 4))
+        line_height = text_h + 10
         text_y = y1 - 8 - label_offset * line_height
-        text_y = max(text_h + 2, text_y)  # Evita che il testo vada sopra l'immagine
-        
-        cv2.rectangle(frame, (text_x, text_y - text_h - 4), (text_x + text_w + 4, text_y + 4), (0,0,0), -1)
-        
+        text_y = max(text_h + 2, text_y)
+
+        cv2.rectangle(frame, (text_x, text_y - text_h - 4), (text_x + text_w + 4, text_y + 4), (0, 0, 0), -1)
         cv2.putText(frame, label, (text_x + 2, text_y), font, font_scale, color, thickness, cv2.LINE_AA)
 
     def _publish_debug(self, debug_frame, header):
@@ -1074,12 +1115,34 @@ class TrackingFSM(Node):
 
 def main():
     rclpy.init()
-    node = TrackingFSM()
-    # MultiThreadedExecutor OBBLIGATORIO qui, non facoltativo: e' quello che
-    # permette al gruppo del client (self._service_group) di elaborare la
-    # risposta del servizio Detect su un thread diverso da quello bloccato
-    # in call_sync() dentro _image_cb (gruppo self._main_group). Con lo
-    # SingleThreadedExecutor di rclpy.spin() la risposta non arriverebbe mai.
+
+    # 1. SDK Spot (le versioni recenti registrano gia' AudioVisualClient;
+    #    la registrazione esplicita resta innocua per quelle piu' vecchie)
+    sdk = bosdyn.client.create_standard_sdk('TrackingFSM_LED_Client')
+    sdk.register_service_client(AudioVisualClient)
+
+    # 2. Robot
+    robot_ip = "192.168.80.3"
+    robot = sdk.create_robot(robot_ip)
+
+    # 3. Credenziali
+    SPOT_USERNAME = "admin"
+    SPOT_PASSWORD = "prb4e3wparqx"
+
+    try:
+        robot.authenticate(SPOT_USERNAME, SPOT_PASSWORD)
+        robot.start_time_sync()   # necessaria: run_behavior converte i tempi in tempo-robot
+        print("[SDK SPOT] Connessione gRPC per i LED inizializzata con successo.")
+    except Exception as e:
+        print(f"[ERRORE SDK SPOT] Impossibile autenticarsi sul robot per i LED: {e}")
+        print("[AVVISO] La FSM funzionera' ma i LED rimarranno invariati.")
+        robot = None
+
+    node = TrackingFSM(robot=robot)
+
+    # MultiThreadedExecutor OBBLIGATORIO: permette al gruppo del client
+    # (self._service_group) di elaborare la risposta del servizio Detect
+    # mentre _image_cb (self._main_group) e' bloccata in call_sync().
     executor = MultiThreadedExecutor(num_threads=4)
     executor.add_node(node)
     try:
@@ -1087,6 +1150,7 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        node.shutdown_leds()
         node.destroy_node()
         rclpy.shutdown()
 
