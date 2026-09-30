@@ -27,7 +27,7 @@ class DetectorNode(Node):
         super().__init__('detector_node')
 
         self.declare_parameter('model_path', '/models/yoloe-11s-seg.pt')
-        self.declare_parameter('default_classes', ['person'])
+        self.declare_parameter('default_classes', ['person','quadruped','quadruped animal','quadruped robot','robotic dog','four-legged robot', 'dog', 'robot','umanoid robot'])
         self.declare_parameter('conf_threshold', 0.35)
         self.declare_parameter('imgsz', 640)
         self.declare_parameter('service_name', 'detect')

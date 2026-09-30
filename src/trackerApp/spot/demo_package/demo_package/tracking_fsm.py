@@ -116,7 +116,7 @@ GOAL_FRAME = 'odom'
 TARGET_POSE_TOPIC = 'target_info'
 
 DETECT_SERVICE = 'detect'
-TARGET_CLASSES = ['person']
+TARGET_CLASSES = ['person','quadruped','quadruped animal','quadruped robot','robotic dog','four-legged robot', 'dog', 'robot','umanoid robot']
 DEBUG_IMAGE_TOPIC = '/person_follow/hand_debug/compressed'  # suffisso /compressed: convenzione
                                                                # image_transport, stessa di /camera/hand/compressed
 
