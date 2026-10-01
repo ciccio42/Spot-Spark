@@ -28,7 +28,7 @@ from ament_index_python.packages import get_package_share_directory
 
 def generate_launch_description():
     package_dir = get_package_share_directory('spot_motion')
-    params_file = os.path.join(package_dir, 'config', 'nav2_params_spot_sim.yaml')
+    params_file = os.path.join(package_dir, 'config', 'nav2_params_spot_real.yaml')
 
     # $(find-pkg-share ...) dentro il YAML non viene MAI risolto: quella
     # sintassi la capisce solo il sistema di lancio (file .launch.xml o
@@ -102,4 +102,12 @@ def generate_launch_description():
             parameters=[params_file],
             remappings=[('cmd_vel', 'cmd_vel_nav'),
                      ('cmd_vel_smoothed', 'cmd_vel')]),
+        
+        Node(
+            package='spot_motion',
+            executable='costmap_refresher',
+            name='costmap_refresher',
+            output='screen',
+            parameters=[{'period': 2.0}],
+        ),
     ])

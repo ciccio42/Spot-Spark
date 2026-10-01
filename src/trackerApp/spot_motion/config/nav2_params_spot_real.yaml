@@ -1,102 +1,124 @@
-# nav2_params_spot.yaml
+# nav2_params_spot_real.yaml
 #
-# Parametri Nav2 per Spot, adattati per il following reattivo SENZA mappa globale
-# (nessun AMCL, nessun map_server) — navigazione puramente reattiva nel frame odom.
+# Parametri Nav2 per Spot REALE — navigazione reattiva nel frame odom,
+# senza mappa globale (nessun AMCL, nessun map_server).
+#
+# Origine dei parametri (merge sim + real):
+#   - Behavior Tree, controller (Regulated Pure Pursuit), planner, goal/progress
+#     checker, velocity_smoother, lifecycle: presi da nav2_params_spot_sim.yaml
+#     (la configurazione verificata in simulazione).
+#   - Costmap (sorgenti, altezze, footprint, tolleranze TF): presi dal vecchio
+#     nav2_params_spot_real.yaml (topic e frame di spot_ros2).
+#   - Modifiche specifiche per il robot vero: marcate con [REAL].
+#
+# Prerequisiti:
+#   - spot_ros2 driver in esecuzione
+#   - depth_launch.py (spot_motion) in esecuzione: converte /depth/<cam>/image in
+#     /depth/<cam>/points, unico formato accettato dall'obstacle_layer.
 
 bt_navigator:
   ros__parameters:
     use_sim_time: False
-    global_frame: odom #odom
-    robot_base_frame: feet_center #body
+    global_frame: odom
+    # [REAL] 'body' esiste sempre nella TF di spot_ros2. Se preferisci
+    # 'feet_center', verifica prima: ros2 run tf2_ros tf2_echo odom feet_center
+    # e sostituiscilo in TUTTI i robot_base_frame di questo file.
+    robot_base_frame: body
+    # [REAL] verifica il nome con: ros2 topic list | grep -i odom
     odom_topic: /odom
-    default_nav_to_pose_bt_xml: "$(find-pkg-share spot_motion)/bt/follow_point.xml"
+    # default_nav_to_pose_bt_xml viene passato da navigation_launch.py
 
 controller_server:
   ros__parameters:
     use_sim_time: False
-    controller_frequency: 10.0
-    min_x_velocity_threshold: 0.001
+    controller_frequency: 20.0
+    min_x_velocity_threshold: 0.05
     min_y_velocity_threshold: 0.001
-    min_theta_velocity_threshold: 0.001
-    controller_plugins: ["FollowPath"]
-    goal_checker_plugins: ["goal_checker"]
-    progress_checker_plugins: ["progress_checker"]
+    min_theta_velocity_threshold: 0.10
 
-    goal_checker:
-      plugin: "nav2_controller::SimpleGoalChecker"
-      xy_goal_tolerance: 0.15
-      stateful: True
-
+    progress_checker_plugin: "progress_checker"
     progress_checker:
       plugin: "nav2_controller::SimpleProgressChecker"
-      required_movement_radius: 0.05    # Tolleranza per sensori a 2Hz: bastano 5 cm...
-      movement_time_allowance: 15.0     # ...in 15 secondi per non far fallire la navigazione a vuoto.
+      required_movement_radius: 0.3
+      movement_time_allowance: 20.0
+
+    goal_checker_plugins: ["general_goal_checker"]
+    general_goal_checker:
+      plugin: "nav2_controller::SimpleGoalChecker"
+      xy_goal_tolerance: 0.30
+      yaw_goal_tolerance: 3.14
+      stateful: True
+
+    controller_plugins: ["FollowPath"]
 
     FollowPath:
-      plugin: "dwb_core::DWBLocalPlanner"
-      publish_evaluation: True
-      publish_cost_grid_pc: True
-      publish_trajectory_pc: True
-      marker_lifetime: 0.5
-      max_vel_x: 0.6
-      min_vel_x: 0.0                    # CORRETTO da 0.3: escludeva anche le traiettorie di pura
-                                          # rotazione (vx=0), esattamente quelle che RotateToGoal
-                                          # vuole proporre quando Spot non e' ancora rivolto verso
-                                          # il goal — con min_vel_x=0.3 non potevano mai esistere
-                                          # come candidati. Se serve SOLO marcia avanti (mai indietro),
-                                          # questo lo garantisce gia' max_vel_x positivo e min_vel_x=0.0,
-                                          # non serve alzare il minimo.
-      max_vel_y: 0.0
-      min_vel_y: 0.0
-      max_vel_theta: 0.8
-      min_vel_theta: -0.8
-      acc_lim_x: 1.0
-      acc_lim_y: 0.0
-      acc_lim_theta: 2.0
-      xy_goal_tolerance: 0.15
-      vx_samples: 20
-      vy_samples: 1                     # CORRETTO da 0: con 0 campioni su Y, il generatore di
-                                          # traiettorie (XYThetaIterator, combinazione di
-                                          # vx_samples x vy_samples x vtheta_samples) produceva
-                                          # 20 x 0 x 40 = ZERO candidati totali — combacia esattamente
-                                          # con l'errore "No valid trajectories out of 0!". Con 1
-                                          # campione (a Y=0, dato min_vel_y=max_vel_y=0.0) si ottiene
-                                          # comunque "nessun movimento laterale", senza azzerare tutto.
-      vtheta_samples: 40
-      trans_stopped_velocity: 0.05
-      critics: ["RotateToGoal", "Oscillation", "BaseObstacle", "GoalAlign", "PathAlign", "PathDist", "GoalDist"]
-
-      RotateToGoal:
-        scale: 5.0
-        lookahead_time: 0.2
+      plugin: "nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController"
+      # [REAL] 1.0 m/s in sim; sul robot vero, vicino a persone, si parte
+      # prudenti. Alzare dopo i primi test (insieme a velocity_smoother).
+      desired_linear_vel: 0.6
+      lookahead_dist: 0.9
+      min_lookahead_dist: 0.6
+      max_lookahead_dist: 1.2
+      use_velocity_scaled_lookahead_dist: false
+      # [REAL] TF via WiFi ha piu' latenza della simulazione (era 0.2).
+      transform_tolerance: 0.5
+      # [REAL] In sim valeva 0.4 perche' sotto quella velocita' l'andatura di
+      # CHAMP camminava sul posto. Spot reale gestisce bene le basse velocita':
+      # cosi' rallenta davvero in avvicinamento e in curva.
+      min_approach_linear_velocity: 0.15
+      approach_velocity_scaling_dist: 1.5
+      use_regulated_linear_velocity_scaling: true
+      regulated_linear_scaling_min_radius: 0.6
+      regulated_linear_scaling_min_speed: 0.15
+      # Nel file sim questa chiave compariva DUE volte (true e poi false).
+      # Qui una sola volta, con il valore che aveva l'ultima occorrenza.
+      use_cost_regulated_linear_velocity_scaling: false
+      cost_scaling_dist: 0.8
+      cost_scaling_gain: 1.0
+      use_collision_detection: true
+      max_allowed_time_to_collision_up_to_carrot: 1.5
+      use_rotate_to_heading: false
+      rotate_to_heading_angular_vel: 0.5
+      rotate_to_heading_min_angle: 0.785
+      max_angular_accel: 1.0
+      allow_reversing: false
+      max_robot_pose_search_dist: 10.0
 
 local_costmap:
   local_costmap:
     ros__parameters:
       use_sim_time: False
-      global_frame: odom #odom
-      robot_base_frame: feet_center #body
+      global_frame: odom
+      robot_base_frame: body
       rolling_window: true
+      update_frequency: 5.0
+      publish_frequency: 2.0
       transform_tolerance: 1.0
-      transform_cache_timeout: 2.0
       width: 6
       height: 6
       resolution: 0.05
-      footprint: "[[0.60, 0.35], [0.60, -0.35], [-0.60, -0.35], [-0.60, 0.35]]"
+      # Footprint del robot vero CON il braccio disteso in avanti (camera della mano).
+      # Il "muso" stretto copre braccio e pinza: le camere frontali li vedono, e le
+      # celle dentro il footprint vengono cancellate (footprint_clearing_enabled).
+      # 1.05 = sporgenza della mano + ~10 cm: MISURALA con
+      #   ros2 run tf2_ros tf2_echo body hand     (x della traslazione)
+      # e aggiorna il valore qui E nel global_costmap.
+      footprint: "[[0.60, 0.35], [1.05, 0.15], [1.05, -0.15], [0.60, -0.35], [-0.60, -0.35], [-0.60, 0.35]]"
+      always_send_full_costmap: true
+      track_unknown_space: false
       plugins: ["obstacle_layer", "inflation_layer"]
-
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: True
-        observation_sources: cam_frontleft cam_frontright 
-        transform_tolerance: 1.0
-        observation_persistence: 1.5
+        # Per usare anche la camera della mano: aggiungere cam_hand qui
+        # (attenzione: vedra' la persona inseguita e la segnera' come ostacolo).
+        observation_sources: cam_frontleft cam_frontright clear_frontleft clear_frontright
         cam_frontleft:
           topic: /depth/frontleft/points
           data_type: "PointCloud2"
           marking: True
           clearing: True
-          min_obstacle_height: 0.12
+          min_obstacle_height: 0.50
           max_obstacle_height: 2.0
           obstacle_max_range: 2.5
           raytrace_max_range: 3.0
@@ -105,10 +127,32 @@ local_costmap:
           data_type: "PointCloud2"
           marking: True
           clearing: True
-          min_obstacle_height: 0.12
+          min_obstacle_height: 0.50
           max_obstacle_height: 2.0
           obstacle_max_range: 2.5
           raytrace_max_range: 3.0
+        # --- SOLA PULIZIA (refresh continuo) -------------------------------
+        # Stesse nuvole, marking: False. La fascia include il pavimento: i raggi
+        # camera -> pavimento attraversano tutte le celle davanti al robot e le
+        # liberano a OGNI nuvola (~2-3 Hz). Un ostacolo che si sposta o se ne va
+        # DENTRO il campo visivo sparisce alla nuvola successiva. Le sorgenti
+        # cam_* sopra segnano di nuovo subito cio' che c'e' davvero.
+        clear_frontleft:
+          topic: /depth/frontleft/points
+          data_type: "PointCloud2"
+          marking: False
+          clearing: True
+          min_obstacle_height: -0.30
+          max_obstacle_height: 2.0
+          raytrace_max_range: 4.0
+        clear_frontright:
+          topic: /depth/frontright/points
+          data_type: "PointCloud2"
+          marking: False
+          clearing: True
+          min_obstacle_height: -0.30
+          max_obstacle_height: 2.0
+          raytrace_max_range: 4.0
         cam_hand:
           topic: /depth/hand/points
           data_type: "PointCloud2"
@@ -118,38 +162,43 @@ local_costmap:
           max_obstacle_height: 2.0
           obstacle_max_range: 3.5
           raytrace_max_range: 4.0
-
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        inflation_radius: 0.40
+        # Come in simulazione. Con 0.40 (vecchio valore real) il costo spariva quasi
+        # subito oltre il raggio inscritto (0.35): il planner passava rasente agli
+        # ostacoli e gli angoli del footprint/il braccio finivano nelle celle letali
+        # -> "RegulatedPurePursuitController detected collision ahead!".
+        inflation_radius: 1.0
+        cost_scaling_factor: 3.0
 
 global_costmap:
   global_costmap:
     ros__parameters:
       use_sim_time: False
-      global_frame: odom #odom
-      robot_base_frame: feet_center #body
+      global_frame: odom
+      robot_base_frame: body
       rolling_window: true
-      width: 10
-      height: 10
+      update_frequency: 2.0
+      publish_frequency: 1.0
+      transform_tolerance: 1.0
+      # 16 m invece di 10: margine per goal lontani (target fino a ~4.5 m).
+      width: 16
+      height: 16
       resolution: 0.05
-      robot_radius: 0.60
+      footprint: "[[0.60, 0.35], [1.05, 0.15], [1.05, -0.15], [0.60, -0.35], [-0.60, -0.35], [-0.60, 0.35]]"
+      always_send_full_costmap: true
+      track_unknown_space: false
       plugins: ["obstacle_layer", "inflation_layer"]
-      transform_tolerance: 1.0 
-      transform_cache_timeout: 2.0
-
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: True
-        observation_sources: cam_frontleft cam_frontright 
-        transform_tolerance: 1.0
-        observation_persistence: 1.5
+        observation_sources: cam_frontleft cam_frontright clear_frontleft clear_frontright
         cam_frontleft:
           topic: /depth/frontleft/points
           data_type: "PointCloud2"
           marking: True
           clearing: True
-          min_obstacle_height: 0.12
+          min_obstacle_height: 0.50
           max_obstacle_height: 2.0
           obstacle_max_range: 2.5
           raytrace_max_range: 3.0
@@ -158,32 +207,48 @@ global_costmap:
           data_type: "PointCloud2"
           marking: True
           clearing: True
-          min_obstacle_height: 0.12
+          min_obstacle_height: 0.50
           max_obstacle_height: 2.0
           obstacle_max_range: 2.5
           raytrace_max_range: 3.0
-        cam_hand:
-          topic: /depth/hand/points
+        # --- SOLA PULIZIA (refresh continuo) -------------------------------
+        # Stesse nuvole, marking: False. La fascia include il pavimento: i raggi
+        # camera -> pavimento attraversano tutte le celle davanti al robot e le
+        # liberano a OGNI nuvola (~2-3 Hz). Un ostacolo che si sposta o se ne va
+        # DENTRO il campo visivo sparisce alla nuvola successiva. Le sorgenti
+        # cam_* sopra segnano di nuovo subito cio' che c'e' davvero.
+        clear_frontleft:
+          topic: /depth/frontleft/points
           data_type: "PointCloud2"
-          marking: True
+          marking: False
           clearing: True
-          min_obstacle_height: 0.18
+          min_obstacle_height: -0.30
           max_obstacle_height: 2.0
-          obstacle_max_range: 3.5
           raytrace_max_range: 4.0
-
+        clear_frontright:
+          topic: /depth/frontright/points
+          data_type: "PointCloud2"
+          marking: False
+          clearing: True
+          min_obstacle_height: -0.30
+          max_obstacle_height: 2.0
+          raytrace_max_range: 4.0
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        inflation_radius: 0.40
+        # Come in simulazione. Con 0.40 (vecchio valore real) il costo spariva quasi
+        # subito oltre il raggio inscritto (0.35): il planner passava rasente agli
+        # ostacoli e gli angoli del footprint/il braccio finivano nelle celle letali
+        # -> "RegulatedPurePursuitController detected collision ahead!".
+        inflation_radius: 1.0
+        cost_scaling_factor: 3.0
 
 planner_server:
   ros__parameters:
     use_sim_time: False
-    expected_planner_frequency: 2.0
     planner_plugins: ["GridBased"]
     GridBased:
       plugin: "nav2_navfn_planner/NavfnPlanner"
-      use_astar: true
+      use_astar: false
       allow_unknown: true
 
 behavior_server:
@@ -200,8 +265,13 @@ behavior_server:
 velocity_smoother:
   ros__parameters:
     use_sim_time: False
-    max_velocity: [0.3, 0.0, 0.5]
+    smoothing_frequency: 20.0
+    feedback: "OPEN_LOOP"
+    # [REAL] stesso limite di desired_linear_vel (era 1.0 in sim)
+    max_velocity: [0.6, 0.0, 0.5]
     min_velocity: [-0.3, 0.0, -0.5]
+    max_accel: [1.0, 0.0, 1.0]
+    max_decel: [-1.0, 0.0, -1.0]
 
 lifecycle_manager:
   ros__parameters:

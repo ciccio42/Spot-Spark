@@ -1,14 +1,29 @@
 <!--
-  Segue una posa dinamica mantenendo una distanza fissa dal bersaglio.
-  Il goal viene aggiornato tramite /goal_update (GoalUpdater) da nav2_bridge.
-  In caso di errore del controller (es. collisione prevista da RPP) svuota il
-  costmap locale, attende e riprova: al nuovo tentativo il percorso viene
-  ricalcolato tenendo conto dell'ostacolo presente nel costmap globale.
+  Segue una posa dinamica aggiornata tramite /goal_update (GoalUpdater) da nav2_bridge.
+
+  REFRESH PERIODICO del costmap LOCALE (RateController hz="0.5" = ogni 2 s):
+    copre gli ostacoli che se ne vanno FUORI dal campo visivo delle camere
+    frontali (es. una persona che passa di lato): li' nessun raggio puo'
+    pulirli. Gli ostacoli davanti ricompaiono alla nuvola successiva
+    (~0.3-0.5 s). Il refresh continuo DENTRO il campo visivo lo fanno invece
+    le sorgenti clear_frontleft/clear_frontright nel YAML.
+    Regolabile: hz="0.33" (3 s) piu' prudente, hz="1.0" (1 s) piu' aggressivo.
+
+  RECOVERY: se il ramo principale fallisce (collisione prevista da RPP,
+  progress checker scaduto, percorso non calcolabile): svuota il costmap
+  locale, attende 1 s, riprova. Dopo 10 fallimenti -> ABORTED, e nav2_bridge
+  invia una nuova navigazione al target successivo.
+
+  TruncatePath: 0.0 con il nav2_bridge nuovo (goal gia' a target_distance).
 -->
 <root main_tree_to_execute="MainTree">
   <BehaviorTree ID="MainTree">
     <RecoveryNode number_of_retries="10" name="FollowWithRecovery">
       <PipelineSequence name="FollowWithReplanning">
+        <RateController hz="0.5">
+          <ClearEntireCostmap name="PeriodicClearLocal"
+            service_name="local_costmap/clear_entirely_local_costmap" />
+        </RateController>
         <RateController hz="3.0">
           <Sequence>
             <GoalUpdater input_goal="{goal}" output_goal="{updated_goal}">
@@ -22,6 +37,8 @@
         </KeepRunningUntilFailure>
       </PipelineSequence>
       <Sequence name="Recovery">
+        <ClearEntireCostmap name="ClearLocalCostmap"
+          service_name="local_costmap/clear_entirely_local_costmap" />
         <Wait wait_duration="1" />
       </Sequence>
     </RecoveryNode>

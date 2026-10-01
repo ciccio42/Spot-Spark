@@ -32,6 +32,9 @@ setup(
             'pose_3d_estimation = spot_motion.pose_3d_estimation:main',
             'spot_motion = spot_motion.spot_motion:main',
             'nav2_bridge = spot_motion.nav2_bridge:main',
+            'nav2_bridge_v2 = spot_motion.nav2_bridge_v2:main',
+            'nav2_backup = spot_motion.nav2_backup:main',
+            'costmap_refresher = spot_motion.costmap_refresh:main',
         ],
     },
 )

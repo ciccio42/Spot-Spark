@@ -1,62 +1,87 @@
 #!/usr/bin/env python3
 """
-nav2_bridge.py (spot_motion)
+nav2_bridge.py (spot_motion) — person following con Nav2 + centraggio.
 
-Collega la percezione (TargetPose3D, pubblicata da Pose3DEstimationNode) a
-Nav2:
+Da TargetPose3D (DOVE si trova la persona) a COSA deve fare il robot.
+Ripristina, sopra Nav2, la politica del vecchio nodo SDK (spot_motion.py):
+"traslo solo se la persona esce dalla fascia di distanza, ruoto sempre per
+tenerla al centro".
 
-  1. Trasforma il target nel frame 'odom' (via TF — non piu' SDK bosdyn,
-     spot_driver pubblica gia' tutto l'albero TF che serve).
-  2. Lo smussa con lo STESSO filtro di Kalman gia' scritto per l'approccio
-     SDK diretto (_ConstantVelocityKalman1D) — matematica pura, riusata
-     senza modifiche, lavora gia' in un frame fisso (odom), qui non serve
-     nemmeno il giro di andata/ritorno per il frame body che faceva
-     motion_command_node.py.
-  3. Al PRIMO target confermato: innesca una NavigateToPose. Il behavior
-     tree NON va specificato qui — usa gia' il default (follow_point.xml,
-     impostato in navigation_launch.py).
-  4. Sui successivi: pubblica su /goal_update, che il nodo GoalUpdater
-     dentro l'albero legge per aggiornare il goal SENZA dover rimandare
-     una nuova azione ogni volta (evita di ricominciare la navigazione da
-     capo ad ogni target).
+MODALITA'
+  NAVIGATE  la persona e' lontana (d > target_distance + enter_margin):
+            goal Nav2 a target_distance DALLA persona, sulla retta
+            robot->persona, orientato verso di lei. Aggiornato via
+            /goal_update (GoalUpdater nel BT), come prima.
+  HOLD      la persona e' nella fascia (o troppo vicina — mai retromarcia):
+            nessun goal Nav2; il bridge ruota il robot sul posto per
+            riportare la persona al centro dell'immagine (= della ROI).
+  Isteresi: si entra in NAVIGATE sopra target_distance + enter_margin e si
+  torna in HOLD sotto target_distance + exit_margin (o a goal raggiunto),
+  per non alternare continuamente le due modalita'.
 
-PERDITA DEL TARGET: a differenza dei comandi SDK diretti (che avevano un
-end_time_secs e scadevano da soli), una NavigateToPose non si ferma da
-sola — bisogna CANCELLARLA esplicitamente. Se non arriva un dato vero da
-piu' di MAX_TARGET_LOSS_SEC, la navigazione in corso viene cancellata.
+CENTRAGGIO (HOLD)
+  L'errore e' calcolato ORA, non al momento dello scatto: la posizione
+  filtrata della persona (in odom, fissa) viene riportata nel frame della
+  camera con la TF attuale. Quindi tiene conto della rotazione gia' fatta dal
+  robot, della latenza della percezione e del disallineamento del braccio.
+      bearing = atan2(x_cam, z_cam)   (frame ottico: x a destra, z in avanti)
+      w = -rot_gain * bearing         (ROS: rotazione positiva = antioraria)
+  Con center_on_camera:=false si centra rispetto al corpo invece che alla
+  camera.
 
-NESSUN cambiamento a tracking_fsm.py — stessa decisione presa per
-l'approccio precedente: ci si basa solo sul tempo reale trascorso
-dall'ultimo dato vero, non sullo stato SEARCH/TRACKING/RECOVERY.
+COMANDO DI ROTAZIONE -> cmd_vel_nav (non /cmd_vel)
+  E' l'ingresso del velocity_smoother, lo stesso topic su cui scrive il
+  controller di Nav2. Cosi' su /cmd_vel scrive un solo nodo (lo smoother),
+  la rotazione viene limitata in accelerazione come la navigazione, e non
+  ci sono due sorgenti in conflitto. Il bridge ruota solo quando nessuna
+  NavigateToPose e' attiva.
+
+BEHAVIOR TREE
+  Il goal e' gia' a distanza dalla persona: usare un BT SENZA troncamento
+  (follow_point_spot.xml, TruncatePath distance="0.0" = default del
+  bt_navigator). Con follow_person_spot.xml la distanza si sommerebbe due
+  volte. Per questo behavior_tree e' vuoto di default.
+
+PERDITA DEL TARGET
+  - rotazione: si ferma se l'ultimo dato e' piu' vecchio di rot_timeout
+    (non si gira su dati vecchi);
+  - navigazione: cancellata dopo MAX_TARGET_LOSS_SEC, come prima.
+
+TOPIC DI DEBUG (RViz)
+  ~/filtered_target  posizione filtrata della persona (odom)
+  ~/standoff_goal    punto a target_distance dalla persona (goal Nav2)
 """
+import math
 import time
 
 import rclpy
-from rclpy.node import Node
 from rclpy.action import ActionClient
+from rclpy.node import Node
 
 import tf2_ros
 from tf2_geometry_msgs import do_transform_pose_stamped
 
-from geometry_msgs.msg import PoseStamped
+from action_msgs.msg import GoalStatus
+from geometry_msgs.msg import PoseStamped, Twist
 from nav2_msgs.action import NavigateToPose
 
 from demo_interfaces.msg import TargetPose3D
 
 # ============================================================
-GLOBAL_FRAME = 'odom'       # deve combaciare con global_frame in nav2_params_spot_real.yaml
-KF_PROCESS_VAR = 0.05       # stessi valori di motion_command_node.py — stesso significato
+GLOBAL_FRAME = 'odom'       # deve combaciare con global_frame nei parametri Nav2
+KF_PROCESS_VAR = 0.05
 KF_MEASUREMENT_VAR = 0.05
 KF_RESET_GAP_SEC = 1.0
-MAX_TARGET_LOSS_SEC = 5.0   # oltre questo senza un dato vero, la navigazione in corso
-                              # viene cancellata esplicitamente — regolabile, non ancora
-                              # tarato su test reali
+MAX_TARGET_LOSS_SEC = 5.0
+CANCEL_FORCE_SEC = 2.0      # se il risultato della cancellazione non arriva, sblocca comunque
 # ============================================================
+
+NAVIGATE = 'NAVIGATE'
+HOLD = 'HOLD'
 
 
 class _ConstantVelocityKalman1D:
-    """Identica a quella in motion_command_node.py — matematica pura,
-    nessuna dipendenza da bosdyn/Nav2, riusata cosi' com'e'."""
+    """Invariata rispetto alla versione precedente."""
 
     def __init__(self, process_var, measurement_var):
         self.pos = 0.0
@@ -92,87 +117,217 @@ class _ConstantVelocityKalman1D:
         ]
 
 
+def _yaw_from_quat(q):
+    return math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+
+
+def _quat_from_yaw(yaw):
+    return 0.0, 0.0, math.sin(yaw / 2.0), math.cos(yaw / 2.0)
+
+
+def _clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
 class Nav2Bridge(Node):
     def __init__(self):
         super().__init__('nav2_bridge')
 
+        # --- parametri ---
+        self.declare_parameter('target_distance', 2.5)   # m, corpo -> persona (come TARGET_DISTANCE SDK)
+        self.declare_parameter('enter_margin', 0.40)     # m oltre target_distance per iniziare a camminare
+        self.declare_parameter('exit_margin', 0.15)      # m oltre target_distance per fermarsi
+        self.declare_parameter('rot_gain', 1.2)          # rad/s per rad di errore
+        self.declare_parameter('max_rot_vel', 0.5)       # rad/s (= limite angolare del velocity_smoother)
+        self.declare_parameter('rot_deadband_deg', 4.0)  # sotto questo errore non ruota
+        self.declare_parameter('rot_timeout', 1.0)       # s: oltre, niente rotazione su dati vecchi
+        self.declare_parameter('center_on_camera', True) # centra nell'immagine (ROI) o rispetto al corpo
+        self.declare_parameter('base_frame', 'body')
+        self.declare_parameter('cmd_vel_topic', 'cmd_vel_nav')
+        self.declare_parameter('behavior_tree', '')      # vuoto = BT di default (senza troncamento)
+
+        gp = lambda n: self.get_parameter(n).value
+        self.D = float(gp('target_distance'))
+        self.enter_margin = float(gp('enter_margin'))
+        self.exit_margin = float(gp('exit_margin'))
+        self.rot_gain = float(gp('rot_gain'))
+        self.max_rot = float(gp('max_rot_vel'))
+        self.deadband = math.radians(float(gp('rot_deadband_deg')))
+        self.rot_timeout = float(gp('rot_timeout'))
+        self.center_on_camera = bool(gp('center_on_camera'))
+        self.base_frame = gp('base_frame')
+        self._behavior_tree = gp('behavior_tree')
+
+        # --- stato ---
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
-
         self._kf_x = _ConstantVelocityKalman1D(KF_PROCESS_VAR, KF_MEASUREMENT_VAR)
         self._kf_y = _ConstantVelocityKalman1D(KF_PROCESS_VAR, KF_MEASUREMENT_VAR)
         self._kf_last_update_time = None
+        self._camera_frame = None
 
+        self.mode = HOLD
         self._goal_active = False
         self._goal_handle = None
+        self._cancel_requested_at = None
+        self._was_rotating = False
 
+        # --- I/O ---
         self.goal_update_pub = self.create_publisher(PoseStamped, 'goal_update', 5)
+        self.debug_target_pub = self.create_publisher(PoseStamped, '~/filtered_target', 5)
+        self.debug_goal_pub = self.create_publisher(PoseStamped, '~/standoff_goal', 5)
+        self.cmd_pub = self.create_publisher(Twist, gp('cmd_vel_topic'), 10)
         self._nav_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
 
         self.create_subscription(TargetPose3D, 'target_3d', self._on_target_pose, 5)
         self.create_timer(1.0, self._check_target_loss)
+        self.create_timer(0.05, self._rotation_loop)  # 20 Hz
 
         self.get_logger().info(
-            f"nav2_bridge pronto. global_frame={GLOBAL_FRAME}, "
-            f"max_target_loss={MAX_TARGET_LOSS_SEC:.1f}s.")
+            f"nav2_bridge pronto: distanza={self.D:.2f} m (cammina oltre {self.D + self.enter_margin:.2f}, "
+            f"si ferma sotto {self.D + self.exit_margin:.2f}), centraggio su "
+            f"{'camera (ROI)' if self.center_on_camera else self.base_frame}, "
+            f"rotazione su '{gp('cmd_vel_topic')}', "
+            f"behavior_tree={self._behavior_tree or '(default del bt_navigator)'}.")
 
+    # ------------------------------------------------------------------
+    # Percezione -> posizione filtrata della persona in odom
+    # ------------------------------------------------------------------
     def _on_target_pose(self, msg: TargetPose3D):
         try:
-            transform = self.tf_buffer.lookup_transform(
-                GLOBAL_FRAME, msg.header.frame_id, rclpy.time.Time())
+            transform = self.tf_buffer.lookup_transform(GLOBAL_FRAME, msg.header.frame_id, rclpy.time.Time())
         except tf2_ros.TransformException as ex:
-            self.get_logger().warn(
-                f"TF non disponibile ({msg.header.frame_id}->{GLOBAL_FRAME}): {ex}",
-                throttle_duration_sec=2.0)
+            self.get_logger().warn(f"TF non disponibile ({msg.header.frame_id}->{GLOBAL_FRAME}): {ex}",
+                                   throttle_duration_sec=2.0)
             return
+        self._camera_frame = msg.header.frame_id
 
         raw_pose = PoseStamped()
         raw_pose.header = msg.header
         raw_pose.pose.position = msg.position
         raw_pose.pose.orientation.w = 1.0
-        world_pose = do_transform_pose_stamped(raw_pose, transform)
+        world = do_transform_pose_stamped(raw_pose, transform)
 
-        # --- Filtro di Kalman, gia' nel frame odom (fisso) — nessun giro
-        # di andata/ritorno per il frame body, a differenza di
-        # motion_command_node.py: qui il goal serve gia' nel frame mondo.
         now = time.monotonic()
         if self._kf_last_update_time is None or (now - self._kf_last_update_time) > KF_RESET_GAP_SEC:
-            self._kf_x.reset(world_pose.pose.position.x)
-            self._kf_y.reset(world_pose.pose.position.y)
+            self._kf_x.reset(world.pose.position.x)
+            self._kf_y.reset(world.pose.position.y)
         else:
             dt = now - self._kf_last_update_time
             self._kf_x.predict(dt)
             self._kf_y.predict(dt)
-            self._kf_x.update(world_pose.pose.position.x)
-            self._kf_y.update(world_pose.pose.position.y)
+            self._kf_x.update(world.pose.position.x)
+            self._kf_y.update(world.pose.position.y)
         self._kf_last_update_time = now
-        # --- fine filtro ---
 
-        goal = PoseStamped()
-        goal.header.stamp = self.get_clock().now().to_msg()
-        goal.header.frame_id = GLOBAL_FRAME
-        goal.pose.position.x = self._kf_x.pos
-        goal.pose.position.y = self._kf_y.pos
-        goal.pose.orientation.w = 1.0  # non critico: TruncatePath+RotateToGoal (gia' attivi)
-                                          # gestiscono l'avvicinamento finale, non l'orientamento
-                                          # del goal lontano
+        robot = self._robot_pose()
+        if robot is None:
+            return
+        rx, ry, _ = robot
+        px, py = self._kf_x.pos, self._kf_y.pos
+        dx, dy = px - rx, py - ry
+        d = math.hypot(dx, dy)
+        heading = math.atan2(dy, dx)  # direzione robot -> persona, in odom
 
-        if not self._goal_active:
-            self._send_initial_goal(goal)
-        else:
-            self.goal_update_pub.publish(goal)
+        self.debug_target_pub.publish(self._pose(px, py, heading))
+        self._decide(d, heading, px, py)
 
+    # ------------------------------------------------------------------
+    # Politica di distanza (con isteresi)
+    # ------------------------------------------------------------------
+    def _decide(self, d, heading, px, py):
+        if d < 1e-3:
+            return
+        far = d > self.D + self.enter_margin
+        near = d < self.D + self.exit_margin
+
+        # goal a distanza D dalla persona, sulla retta robot->persona, orientato verso di lei
+        gx = px - self.D * math.cos(heading)
+        gy = py - self.D * math.sin(heading)
+        goal = self._pose(gx, gy, heading)
+
+        if self.mode == HOLD and far:
+            self.mode = NAVIGATE
+            self.get_logger().info(f"Persona a {d:.2f} m -> NAVIGATE")
+        elif self.mode == NAVIGATE and near:
+            self.mode = HOLD
+            self.get_logger().info(f"Persona a {d:.2f} m -> HOLD (stop e centraggio)")
+            self._cancel_navigation()
+            return
+
+        if self.mode == NAVIGATE:
+            self.debug_goal_pub.publish(goal)
+            if not self._goal_active:
+                self._send_initial_goal(goal)
+            elif self._cancel_requested_at is None:
+                self.goal_update_pub.publish(goal)
+
+    # ------------------------------------------------------------------
+    # Centraggio: rotazione sul posto in HOLD
+    # ------------------------------------------------------------------
+    def _rotation_loop(self):
+        # Forza lo sblocco se la conferma della cancellazione non arriva
+        if self._cancel_requested_at is not None and time.monotonic() - self._cancel_requested_at > CANCEL_FORCE_SEC:
+            self.get_logger().warn("Cancellazione non confermata: considero la navigazione terminata.")
+            self._goal_active = False
+            self._goal_handle = None
+            self._cancel_requested_at = None
+
+        fresh = (self._kf_last_update_time is not None
+                 and time.monotonic() - self._kf_last_update_time < self.rot_timeout)
+        can_rotate = self.mode == HOLD and not self._goal_active and fresh
+
+        if not can_rotate:
+            if self._was_rotating:
+                self.cmd_pub.publish(Twist())  # uno stop esplicito quando si smette di ruotare
+                self._was_rotating = False
+            return
+
+        err = self._centering_error()
+        if err is None:
+            return
+        w = 0.0 if abs(err) < self.deadband else _clamp(self.rot_gain * err, -self.max_rot, self.max_rot)
+
+        cmd = Twist()
+        cmd.angular.z = w
+        self.cmd_pub.publish(cmd)
+        self._was_rotating = True
+        self.get_logger().info(f"HOLD: errore={math.degrees(err):+.1f} deg  w={w:+.2f} rad/s",
+                               throttle_duration_sec=1.0)
+
+    def _centering_error(self):
+        """Errore angolare (rad, positivo = la persona e' a SINISTRA, quindi ruotare in senso
+        antiorario), calcolato con la TF ATTUALE."""
+        px, py = self._kf_x.pos, self._kf_y.pos
+        if self.center_on_camera and self._camera_frame:
+            try:
+                tf_cam = self.tf_buffer.lookup_transform(self._camera_frame, GLOBAL_FRAME, rclpy.time.Time())
+            except tf2_ros.TransformException:
+                return None
+            p = do_transform_pose_stamped(self._pose(px, py, 0.0), tf_cam).pose.position
+            # frame ottico: x a destra, z in avanti -> bearing positivo = a destra
+            return -math.atan2(p.x, p.z)
+        robot = self._robot_pose()
+        if robot is None:
+            return None
+        rx, ry, ryaw = robot
+        desired = math.atan2(py - ry, px - rx)
+        return math.atan2(math.sin(desired - ryaw), math.cos(desired - ryaw))
+
+    # ------------------------------------------------------------------
+    # Nav2
+    # ------------------------------------------------------------------
     def _send_initial_goal(self, goal: PoseStamped):
-        if not self._nav_client.wait_for_server(timeout_sec=2.0):
-            self.get_logger().warn("Action navigate_to_pose non disponibile.")
+        if not self._nav_client.wait_for_server(timeout_sec=0.5):
+            self.get_logger().warn("Action navigate_to_pose non disponibile.", throttle_duration_sec=5.0)
             return
         req = NavigateToPose.Goal()
         req.pose = goal
+        if self._behavior_tree:
+            req.behavior_tree = self._behavior_tree
         self._goal_active = True
-        future = self._nav_client.send_goal_async(req)
-        future.add_done_callback(self._on_goal_response)
-        self.get_logger().info(
-            f"NavigateToPose inviata: ({goal.pose.position.x:.2f}, {goal.pose.position.y:.2f})")
+        self._nav_client.send_goal_async(req).add_done_callback(self._on_goal_response)
+        self.get_logger().info(f"NavigateToPose inviata: ({goal.pose.position.x:.2f}, {goal.pose.position.y:.2f})")
 
     def _on_goal_response(self, future):
         handle = future.result()
@@ -181,25 +336,59 @@ class Nav2Bridge(Node):
             self._goal_active = False
             return
         self._goal_handle = handle
+        # Se nel frattempo siamo passati in HOLD, cancella subito
+        if self.mode == HOLD:
+            self._cancel_navigation()
         handle.get_result_async().add_done_callback(self._on_goal_result)
 
     def _on_goal_result(self, future):
-        result = future.result()
-        self.get_logger().warn(
-            f"[DEBUG] Goal concluso — status={result.status} "
-            f"(4=SUCCEEDED, 5=CANCELED, 6=ABORTED)")
+        status = future.result().status
+        names = {GoalStatus.STATUS_SUCCEEDED: 'SUCCEEDED', GoalStatus.STATUS_CANCELED: 'CANCELED',
+                 GoalStatus.STATUS_ABORTED: 'ABORTED'}
+        self.get_logger().info(f"Navigazione terminata: {names.get(status, status)}")
         self._goal_active = False
         self._goal_handle = None
+        self._cancel_requested_at = None
+        if status == GoalStatus.STATUS_SUCCEEDED and self.mode == NAVIGATE:
+            self.mode = HOLD  # arrivato a distanza: da qui centraggio
+
+    def _cancel_navigation(self):
+        if self._goal_handle is not None and self._cancel_requested_at is None:
+            self._goal_handle.cancel_goal_async()
+            self._cancel_requested_at = time.monotonic()
 
     def _check_target_loss(self):
-        if not self._goal_active or self._kf_last_update_time is None:
+        if self._kf_last_update_time is None:
             return
         elapsed = time.monotonic() - self._kf_last_update_time
-        if elapsed > MAX_TARGET_LOSS_SEC:
-            self.get_logger().warn(f"Target perso da {elapsed:.1f}s — cancello la navigazione.")
-            if self._goal_handle is not None:
-                self._goal_handle.cancel_goal_async()
-            self._goal_active = False
+        if elapsed > MAX_TARGET_LOSS_SEC and self._goal_active:
+            self.get_logger().warn(f"Target perso da {elapsed:.1f}s: cancello la navigazione.")
+            self._cancel_navigation()
+            self.mode = HOLD
+
+    # ------------------------------------------------------------------
+    # Utility
+    # ------------------------------------------------------------------
+    def _robot_pose(self):
+        try:
+            t = self.tf_buffer.lookup_transform(GLOBAL_FRAME, self.base_frame, rclpy.time.Time())
+        except tf2_ros.TransformException as ex:
+            self.get_logger().warn(f"Posa robot non disponibile ({GLOBAL_FRAME}->{self.base_frame}): {ex}",
+                                   throttle_duration_sec=2.0)
+            return None
+        tr = t.transform.translation
+        return tr.x, tr.y, _yaw_from_quat(t.transform.rotation)
+
+    def _pose(self, x, y, yaw):
+        p = PoseStamped()
+        p.header.stamp = self.get_clock().now().to_msg()
+        p.header.frame_id = GLOBAL_FRAME
+        p.pose.position.x = x
+        p.pose.position.y = y
+        qx, qy, qz, qw = _quat_from_yaw(yaw)
+        p.pose.orientation.x, p.pose.orientation.y = qx, qy
+        p.pose.orientation.z, p.pose.orientation.w = qz, qw
+        return p
 
 
 def main():
@@ -210,8 +399,9 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        node.cmd_pub.publish(Twist())
         node.destroy_node()
-    rclpy.shutdown()
+        rclpy.shutdown()
 
 
 if __name__ == '__main__':
