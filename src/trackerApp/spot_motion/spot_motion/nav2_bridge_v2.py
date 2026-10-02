@@ -1,55 +1,55 @@
 #!/usr/bin/env python3
 """
-nav2_bridge.py (spot_motion) — person following con Nav2 + centraggio.
+nav2_bridge.py (spot_motion) — person following with Nav2 + centring.
 
-Da TargetPose3D (DOVE si trova la persona) a COSA deve fare il robot.
-Ripristina, sopra Nav2, la politica del vecchio nodo SDK (spot_motion.py):
-"traslo solo se la persona esce dalla fascia di distanza, ruoto sempre per
-tenerla al centro".
+From TargetPose3D (WHERE the person is) to WHAT the robot must do.
+Restores, on top of Nav2, the policy of the old SDK node (spot_motion.py):
+"translate only if the person leaves the distance band, always rotate to
+keep them centred".
 
-MODALITA'
-  NAVIGATE  la persona e' lontana (d > target_distance + enter_margin):
-            goal Nav2 a target_distance DALLA persona, sulla retta
-            robot->persona, orientato verso di lei. Aggiornato via
-            /goal_update (GoalUpdater nel BT), come prima.
-  HOLD      la persona e' nella fascia (o troppo vicina — mai retromarcia):
-            nessun goal Nav2; il bridge ruota il robot sul posto per
-            riportare la persona al centro dell'immagine (= della ROI).
-  Isteresi: si entra in NAVIGATE sopra target_distance + enter_margin e si
-  torna in HOLD sotto target_distance + exit_margin (o a goal raggiunto),
-  per non alternare continuamente le due modalita'.
+MODES
+  NAVIGATE  the person is far (d > target_distance + enter_margin):
+            Nav2 goal at target_distance FROM the person, on the
+            robot->person line, facing them. Updated via
+            /goal_update (GoalUpdater in the BT), as before.
+  HOLD      the person is inside the band (or too close — never reverse):
+            no Nav2 goal; the bridge rotates the robot in place to bring
+            the person back to the centre of the image (= of the ROI).
+  Hysteresis: enter NAVIGATE above target_distance + enter_margin and go
+  back to HOLD below target_distance + exit_margin (or when the goal is
+  reached), so as not to keep switching between the two modes.
 
-CENTRAGGIO (HOLD)
-  L'errore e' calcolato ORA, non al momento dello scatto: la posizione
-  filtrata della persona (in odom, fissa) viene riportata nel frame della
-  camera con la TF attuale. Quindi tiene conto della rotazione gia' fatta dal
-  robot, della latenza della percezione e del disallineamento del braccio.
-      bearing = atan2(x_cam, z_cam)   (frame ottico: x a destra, z in avanti)
-      w = -rot_gain * bearing         (ROS: rotazione positiva = antioraria)
-  Con center_on_camera:=false si centra rispetto al corpo invece che alla
-  camera.
+CENTRING (HOLD)
+  The error is computed NOW, not at the time of the shot: the filtered
+  position of the person (in odom, fixed) is brought back into the camera
+  frame with the current TF. So it accounts for the rotation the robot has
+  already made, the perception latency and the arm misalignment.
+      bearing = atan2(x_cam, z_cam)   (optical frame: x right, z forward)
+      w = -rot_gain * bearing         (ROS: positive rotation = counter-clockwise)
+  With center_on_camera:=false it centres relative to the body instead of
+  the camera.
 
-COMANDO DI ROTAZIONE -> cmd_vel_nav (non /cmd_vel)
-  E' l'ingresso del velocity_smoother, lo stesso topic su cui scrive il
-  controller di Nav2. Cosi' su /cmd_vel scrive un solo nodo (lo smoother),
-  la rotazione viene limitata in accelerazione come la navigazione, e non
-  ci sono due sorgenti in conflitto. Il bridge ruota solo quando nessuna
-  NavigateToPose e' attiva.
+ROTATION COMMAND -> cmd_vel_nav (not /cmd_vel)
+  It is the input of the velocity_smoother, the same topic the Nav2
+  controller writes to. This way only one node (the smoother) writes on
+  /cmd_vel, the rotation is acceleration-limited like the navigation, and
+  there are no two conflicting sources. The bridge only rotates when no
+  NavigateToPose is active.
 
 BEHAVIOR TREE
-  Il goal e' gia' a distanza dalla persona: usare un BT SENZA troncamento
-  (follow_point_spot.xml, TruncatePath distance="0.0" = default del
-  bt_navigator). Con follow_person_spot.xml la distanza si sommerebbe due
-  volte. Per questo behavior_tree e' vuoto di default.
+  The goal is already at a distance from the person: use a BT WITHOUT
+  truncation (follow_point_spot.xml, TruncatePath distance="0.0" = the
+  bt_navigator default). With follow_person_spot.xml the distance would be
+  added twice. That is why behavior_tree is empty by default.
 
-PERDITA DEL TARGET
-  - rotazione: si ferma se l'ultimo dato e' piu' vecchio di rot_timeout
-    (non si gira su dati vecchi);
-  - navigazione: cancellata dopo MAX_TARGET_LOSS_SEC, come prima.
+TARGET LOSS
+  - rotation: stops if the last data is older than rot_timeout
+    (no turning on stale data);
+  - navigation: cancelled after MAX_TARGET_LOSS_SEC, as before.
 
-TOPIC DI DEBUG (RViz)
-  ~/filtered_target  posizione filtrata della persona (odom)
-  ~/standoff_goal    punto a target_distance dalla persona (goal Nav2)
+DEBUG TOPICS (RViz)
+  ~/filtered_target  filtered position of the person (odom)
+  ~/standoff_goal    point at target_distance from the person (Nav2 goal)
 """
 import math
 import time
@@ -68,12 +68,12 @@ from nav2_msgs.action import NavigateToPose
 from demo_interfaces.msg import TargetPose3D
 
 # ============================================================
-GLOBAL_FRAME = 'odom'       # deve combaciare con global_frame nei parametri Nav2
+GLOBAL_FRAME = 'odom'       # must match global_frame in the Nav2 parameters
 KF_PROCESS_VAR = 0.05
 KF_MEASUREMENT_VAR = 0.05
 KF_RESET_GAP_SEC = 1.0
 MAX_TARGET_LOSS_SEC = 5.0
-CANCEL_FORCE_SEC = 2.0      # se il risultato della cancellazione non arriva, sblocca comunque
+CANCEL_FORCE_SEC = 2.0      # if the cancellation result does not arrive, unblock anyway
 # ============================================================
 
 NAVIGATE = 'NAVIGATE'
@@ -81,7 +81,7 @@ HOLD = 'HOLD'
 
 
 class _ConstantVelocityKalman1D:
-    """Invariata rispetto alla versione precedente."""
+    """Unchanged from the previous version."""
 
     def __init__(self, process_var, measurement_var):
         self.pos = 0.0
@@ -133,18 +133,18 @@ class Nav2Bridge(Node):
     def __init__(self):
         super().__init__('nav2_bridge')
 
-        # --- parametri ---
-        self.declare_parameter('target_distance', 2.5)   # m, corpo -> persona (come TARGET_DISTANCE SDK)
-        self.declare_parameter('enter_margin', 0.40)     # m oltre target_distance per iniziare a camminare
-        self.declare_parameter('exit_margin', 0.15)      # m oltre target_distance per fermarsi
-        self.declare_parameter('rot_gain', 1.2)          # rad/s per rad di errore
-        self.declare_parameter('max_rot_vel', 0.5)       # rad/s (= limite angolare del velocity_smoother)
-        self.declare_parameter('rot_deadband_deg', 4.0)  # sotto questo errore non ruota
-        self.declare_parameter('rot_timeout', 1.0)       # s: oltre, niente rotazione su dati vecchi
-        self.declare_parameter('center_on_camera', True) # centra nell'immagine (ROI) o rispetto al corpo
+        # --- parameters ---
+        self.declare_parameter('target_distance', 2.5)   # m, body -> person (like the SDK TARGET_DISTANCE)
+        self.declare_parameter('enter_margin', 0.40)     # m beyond target_distance to start walking
+        self.declare_parameter('exit_margin', 0.15)      # m beyond target_distance to stop
+        self.declare_parameter('rot_gain', 1.2)          # rad/s per rad of error
+        self.declare_parameter('max_rot_vel', 0.5)       # rad/s (= angular limit of the velocity_smoother)
+        self.declare_parameter('rot_deadband_deg', 4.0)  # no rotation below this error
+        self.declare_parameter('rot_timeout', 1.0)       # s: beyond this, no rotation on stale data
+        self.declare_parameter('center_on_camera', True) # centre in the image (ROI) or relative to the body
         self.declare_parameter('base_frame', 'body')
         self.declare_parameter('cmd_vel_topic', 'cmd_vel_nav')
-        self.declare_parameter('behavior_tree', '')      # vuoto = BT di default (senza troncamento)
+        self.declare_parameter('behavior_tree', '')      # empty = default BT (no truncation)
 
         gp = lambda n: self.get_parameter(n).value
         self.D = float(gp('target_distance'))
@@ -158,7 +158,7 @@ class Nav2Bridge(Node):
         self.base_frame = gp('base_frame')
         self._behavior_tree = gp('behavior_tree')
 
-        # --- stato ---
+        # --- state ---
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
         self._kf_x = _ConstantVelocityKalman1D(KF_PROCESS_VAR, KF_MEASUREMENT_VAR)
@@ -191,7 +191,7 @@ class Nav2Bridge(Node):
             f"behavior_tree={self._behavior_tree or '(default del bt_navigator)'}.")
 
     # ------------------------------------------------------------------
-    # Percezione -> posizione filtrata della persona in odom
+    # Perception -> filtered position of the person in odom
     # ------------------------------------------------------------------
     def _on_target_pose(self, msg: TargetPose3D):
         try:
@@ -227,13 +227,13 @@ class Nav2Bridge(Node):
         px, py = self._kf_x.pos, self._kf_y.pos
         dx, dy = px - rx, py - ry
         d = math.hypot(dx, dy)
-        heading = math.atan2(dy, dx)  # direzione robot -> persona, in odom
+        heading = math.atan2(dy, dx)  # robot -> person direction, in odom
 
         self.debug_target_pub.publish(self._pose(px, py, heading))
         self._decide(d, heading, px, py)
 
     # ------------------------------------------------------------------
-    # Politica di distanza (con isteresi)
+    # Distance policy (with hysteresis)
     # ------------------------------------------------------------------
     def _decide(self, d, heading, px, py):
         if d < 1e-3:
@@ -241,7 +241,7 @@ class Nav2Bridge(Node):
         far = d > self.D + self.enter_margin
         near = d < self.D + self.exit_margin
 
-        # goal a distanza D dalla persona, sulla retta robot->persona, orientato verso di lei
+        # goal at distance D from the person, on the robot->person line, facing them
         gx = px - self.D * math.cos(heading)
         gy = py - self.D * math.sin(heading)
         goal = self._pose(gx, gy, heading)
@@ -263,10 +263,10 @@ class Nav2Bridge(Node):
                 self.goal_update_pub.publish(goal)
 
     # ------------------------------------------------------------------
-    # Centraggio: rotazione sul posto in HOLD
+    # Centring: in-place rotation in HOLD
     # ------------------------------------------------------------------
     def _rotation_loop(self):
-        # Forza lo sblocco se la conferma della cancellazione non arriva
+        # Force unblocking if the cancellation confirmation does not arrive
         if self._cancel_requested_at is not None and time.monotonic() - self._cancel_requested_at > CANCEL_FORCE_SEC:
             self.get_logger().warn("Cancellazione non confermata: considero la navigazione terminata.")
             self._goal_active = False
@@ -279,7 +279,7 @@ class Nav2Bridge(Node):
 
         if not can_rotate:
             if self._was_rotating:
-                self.cmd_pub.publish(Twist())  # uno stop esplicito quando si smette di ruotare
+                self.cmd_pub.publish(Twist())  # an explicit stop when rotation ends
                 self._was_rotating = False
             return
 
@@ -296,8 +296,8 @@ class Nav2Bridge(Node):
                                throttle_duration_sec=1.0)
 
     def _centering_error(self):
-        """Errore angolare (rad, positivo = la persona e' a SINISTRA, quindi ruotare in senso
-        antiorario), calcolato con la TF ATTUALE."""
+        """Angular error (rad, positive = the person is on the LEFT, so rotate
+        counter-clockwise), computed with the CURRENT TF."""
         px, py = self._kf_x.pos, self._kf_y.pos
         if self.center_on_camera and self._camera_frame:
             try:
@@ -305,7 +305,7 @@ class Nav2Bridge(Node):
             except tf2_ros.TransformException:
                 return None
             p = do_transform_pose_stamped(self._pose(px, py, 0.0), tf_cam).pose.position
-            # frame ottico: x a destra, z in avanti -> bearing positivo = a destra
+            # optical frame: x right, z forward -> positive bearing = to the right
             return -math.atan2(p.x, p.z)
         robot = self._robot_pose()
         if robot is None:
@@ -336,7 +336,7 @@ class Nav2Bridge(Node):
             self._goal_active = False
             return
         self._goal_handle = handle
-        # Se nel frattempo siamo passati in HOLD, cancella subito
+        # If we switched to HOLD in the meantime, cancel right away
         if self.mode == HOLD:
             self._cancel_navigation()
         handle.get_result_async().add_done_callback(self._on_goal_result)
@@ -350,7 +350,7 @@ class Nav2Bridge(Node):
         self._goal_handle = None
         self._cancel_requested_at = None
         if status == GoalStatus.STATUS_SUCCEEDED and self.mode == NAVIGATE:
-            self.mode = HOLD  # arrivato a distanza: da qui centraggio
+            self.mode = HOLD  # reached the distance: centring from here on
 
     def _cancel_navigation(self):
         if self._goal_handle is not None and self._cancel_requested_at is None:

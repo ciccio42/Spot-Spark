@@ -2,12 +2,12 @@
 """
 detector_node.py
 
-Nodo ROS2 (vive nel container "yolo"): fa girare YoloEInference ed espone il
-servizio sincrono detector_interfaces/srv/Detect. Non sa nulla di TF, depth,
-Nav2, coni o ROI — la sua UNICA responsabilita' e': "dato un frame intero
-(+ classi), rispondi con le detection". Tutto il resto (proiezione del
-cono, eventuale filtro sui risultati, visualizzazione) e' compito di
-demo_package, che chiama questo servizio.
+ROS 2 node (lives in the "yolo" container): runs YoloEInference and exposes
+the synchronous detector_interfaces/srv/Detect service. It knows nothing about
+TF, depth, Nav2, cones or ROI — its ONLY responsibility is: "given a full
+frame (+ classes), answer with the detections". Everything else (cone
+projection, any filtering of the results, visualisation) is the job of
+demo_package, which calls this service.
 """
 
 import time
@@ -31,22 +31,22 @@ class DetectorNode(Node):
         self.declare_parameter('conf_threshold', 0.35)
         self.declare_parameter('imgsz', 640)
         self.declare_parameter('service_name', 'detect')
-        self.declare_parameter('use_tracker', False)  # True: model.track() con BoT-SORT (track_id
-                                                        # persistente); False: detect() semplice, per
-                                                        # confronto/debug — nessun track_id, sempre -1.
-        self.declare_parameter('tracker_config', '/home/yolo_ws/src/yolo/detector_package/oc_sort.yaml')  # percorso del file di config del
-                                                        # tracker — 'botsort.yaml' usa quello di default
-                                                        # di Ultralytics (with_reid: False); per abilitare
-                                                        # il ReID, punta a un percorso assoluto di una tua
-                                                        # copia con with_reid: True (es. /models/botsort_reid.yaml)
-        self.declare_parameter('reid_model_name', 'osnet_x1_0')  # nome del modello (libreria torchreid) —
-                                                        # vedi torchreid.models.show_avai_models() per le
-                                                        # varianti disponibili (osnet_x0_25 = piu' leggero)
-        self.declare_parameter('reid_model_path', '/home/yolo_ws/osnet/osnet_x1_0_imagenet.pth')  #percorso LOCALE dei pesi pre-addestrati
-                                                        # (es. /models/osnet_x1_0_market1501.pth) per il
-                                                        # NOSTRO ReID (confronto coseno in demo_package,
-                                                        # indipendente da BoT-SORT). Stringa vuota = disattivato,
-                                                        # BoxDetection.embedding arriva sempre vuoto.
+        self.declare_parameter('use_tracker', False)  # True: model.track() with BoT-SORT (persistent
+                                                        # track_id); False: plain detect(), for
+                                                        # comparison/debug — no track_id, always -1.
+        self.declare_parameter('tracker_config', '/home/yolo_ws/src/yolo/detector_package/oc_sort.yaml')  # path of the tracker config
+                                                        # file — 'botsort.yaml' uses the Ultralytics default
+                                                        # one (with_reid: False); to enable ReID, point
+                                                        # to the absolute path of your own copy with
+                                                        # with_reid: True (e.g. /models/botsort_reid.yaml)
+        self.declare_parameter('reid_model_name', 'osnet_x1_0')  # model name (torchreid library) —
+                                                        # see torchreid.models.show_avai_models() for the
+                                                        # available variants (osnet_x0_25 = lighter)
+        self.declare_parameter('reid_model_path', '/home/yolo_ws/osnet/osnet_x1_0_imagenet.pth')  # LOCAL path of the pre-trained weights
+                                                        # (e.g. /models/osnet_x1_0_market1501.pth) for
+                                                        # OUR ReID (cosine comparison in demo_package,
+                                                        # independent of BoT-SORT). Empty string = disabled,
+                                                        # BoxDetection.embedding is always empty.
 
         gp = self.get_parameter
         self.default_classes = list(gp('default_classes').value)
@@ -113,10 +113,10 @@ class DetectorNode(Node):
                 f"(immagine {request.image.width}x{request.image.height})")
 
         except Exception as ex:
-            # Non lasciare che un frame corrotto o un errore del modello
-            # facciano cadere il servizio: si risponde vuoto e si logga, il
-            # chiamante (DetectClient) tratta gia' questo caso come "nessuna
-            # detection disponibile per questo frame".
+            # Do not let a corrupted frame or a model error bring the
+            # service down: answer empty and log it, the caller
+            # (DetectClient) already treats this case as "no detection
+            # available for this frame".
             self.get_logger().error(f"Detection fallita: {ex}")
             response.detections = []
 

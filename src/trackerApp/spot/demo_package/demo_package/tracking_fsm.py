@@ -2,44 +2,45 @@
 """
 tracking_fsm.py (demo_package)
 
-DUE METODI COMPLETAMENTE SEPARATI, non intrecciati — scelti con UN SOLO
-switch in cima al file (TRACKING_METHOD). Non e' "quale similarita' uso
-nel recovery": sono due architetture diverse, ciascuna con la propria
-implementazione di SEARCH/TRACKING/RECOVERY, per poterle confrontare senza
-che una contamini l'altra.
+TWO COMPLETELY SEPARATE METHODS, not intertwined — chosen with ONE SINGLE
+switch at the top of the file (TRACKING_METHOD). It is not "which similarity
+do I use in recovery": they are two different architectures, each with its
+own implementation of SEARCH/TRACKING/RECOVERY, so they can be compared
+without one contaminating the other.
 
-  "botsort_hsv": l'identita' del target si basa SOLO su BoT-SORT
-      (track_id persistente, model.track()) + istogramma HSV come rete di
-      sicurezza quando il track_id sparisce. Nessun embedding neurale
-      coinvolto, in nessuno stato.
+  "botsort_hsv": the target identity relies ONLY on BoT-SORT
+      (persistent track_id, model.track()) + an HSV histogram as a safety
+      net when the track_id disappears. No neural embedding involved, in
+      any state.
 
-  "embedding_only": l'identita' si basa SOLO sull'embedding neurale
-      (modello di ReID separato lato DetectorNode) — in TUTTI gli stati,
-      SEARCH compreso. BoT-SORT/track_id non vengono mai usati per decidere
-      chi e' il target (anche se il servizio li calcola comunque,
-      semplicemente li ignoriamo).
+  "embedding_only": the identity relies ONLY on the neural embedding
+      (separate ReID model on the DetectorNode side) — in ALL states,
+      SEARCH included. BoT-SORT/track_id are never used to decide who the
+      target is (even if the service computes them anyway, we simply
+      ignore them).
 
-Design comune a entrambi i metodi (invariato):
-  - ROI come ritaglio dell'immagine (FOV via intrinseci, altezza da
-    frazioni fisse — nessuna TF).
-  - Distanza letta dalla depth ToF (patch centrata sul box).
-  - Chiamata al servizio Detect SINCRONA/bloccante, executor multi-thread
-    con gruppi di callback separati (client vs resto) per evitare deadlock.
-  - TRACKING -> periodo di tolleranza a FRAME -> RECOVERY (timeout a
-    TEMPO REALE) -> WAITING_TRIGGER se il target non si ritrova.
+Design shared by both methods (unchanged):
+  - ROI as an image crop (FOV via intrinsics, height from fixed
+    fractions — no TF).
+  - Distance read from the ToF depth (patch centred on the box).
+  - SYNCHRONOUS/blocking call to the Detect service, multi-threaded
+    executor with separate callback groups (client vs the rest) to avoid
+    deadlocks.
+  - TRACKING -> FRAME-based grace period -> RECOVERY (REAL-TIME
+    timeout) -> WAITING_TRIGGER if the target is not found again.
 
-LED di Spot (AudioVisualClient, SDK gRPC di Boston Dynamics):
-  - Gestiti da un THREAD DEDICATO (_led_worker), mai da _image_cb: le
-    chiamate gRPC al robot non devono aggiungere latenza alla percezione.
-  - Il software del robot 5.0.1 NON permette di creare behavior
-    personalizzati (AddOrModifyBehavior arriva nelle versioni successive):
-    ogni stato viene associato al NOME di un behavior gia' presente sul
-    robot (STATI_LED). Per elencarli: list_spot_led_behaviors.py.
-  - Al cambio di stato il behavior precedente viene fermato e il nuovo
-    avviato; ogni LED_REFRESH_SEC se ne estende la scadenza
-    (LED_DURATION_SEC): se il nodo muore, i LED tornano normali da soli.
-  - Se il sistema A/V non e' disponibile o nessuno stato ha un behavior,
-    i LED restano disattivati ma la FSM funziona normalmente.
+Spot LEDs (AudioVisualClient, Boston Dynamics gRPC SDK):
+  - Handled by a DEDICATED THREAD (_led_worker), never by _image_cb: gRPC
+    calls to the robot must not add latency to perception.
+  - Robot software 5.0.1 does NOT allow creating custom behaviors
+    (AddOrModifyBehavior arrives in later versions): each state is mapped
+    to the NAME of a behavior already present on the robot (STATI_LED).
+    To list them: list_spot_led_behaviors.py.
+  - On a state change the previous behavior is stopped and the new one
+    started; every LED_REFRESH_SEC its expiry (LED_DURATION_SEC) is
+    extended: if the node dies, the LEDs go back to normal by themselves.
+  - If the A/V system is not available or no state has a behavior, the
+    LEDs stay disabled but the FSM works normally.
 """
 
 import math
@@ -78,61 +79,61 @@ TRACKING = "tracking"
 RECOVERY = "recovery"
 
 # ============================================================
-# LED — per ogni stato della FSM, il NOME di un behavior A/V GIA' presente
-# sul robot (il software del robot 5.0.1 non permette di crearne di nuovi:
-# AddOrModifyBehavior esiste solo dalle versioni successive).
-# Per vedere i nomi disponibili, con colori e presenza di audio:
+# LED — for each FSM state, the NAME of an A/V behavior ALREADY present
+# on the robot (robot software 5.0.1 does not allow creating new ones:
+# AddOrModifyBehavior only exists from later versions).
+# To see the available names, with colours and whether they have audio:
 #     python3 list_spot_led_behaviors.py
-# None = nessun behavior per quello stato (i LED tornano al comportamento
-# normale del robot). Evita behavior con AUDIO (lo script li segnala):
-# suonerebbero il buzzer a ogni cambio di stato.
+# None = no behavior for that state (the LEDs go back to the robot's normal
+# behaviour). Avoid behaviors with AUDIO (the script flags them): they would
+# sound the buzzer at every state change.
 # ============================================================
 STATI_LED = {
     INIT:            None,
-    WAITING_TRIGGER: None,                               # LED normali del robot
-    SEARCH:          "internal_autonomous_operation",    # bianco pulsante  (priorità 3)
-    TRACKING:        "internal_wait_for_entity",         # verde pulsante   (priorità 6)
-    RECOVERY:        "internal_autonomous_navigation",   # verde lampeggiante (priorità 4)
+    WAITING_TRIGGER: None,                               # robot's normal LEDs
+    SEARCH:          "internal_autonomous_operation",    # pulsing white   (priority 3)
+    TRACKING:        "internal_wait_for_entity",         # pulsing green   (priority 6)
+    RECOVERY:        "internal_autonomous_navigation",   # blinking green  (priority 4)
 }
-LED_DURATION_SEC = 5.0     # scadenza di ogni run_behavior (se il nodo muore, i LED si spengono da soli)
-LED_REFRESH_SEC = 2.0      # ogni quanto il worker rinnova il behavior (deve essere < LED_DURATION_SEC)
+LED_DURATION_SEC = 5.0     # expiry of each run_behavior (if the node dies, the LEDs turn off by themselves)
+LED_REFRESH_SEC = 2.0      # how often the worker renews the behavior (must be < LED_DURATION_SEC)
 
 # ============================================================
-# LO SWITCH — decide quale delle due architetture usare per l'intera
-# sessione. Cambia questo, ricompila, testa; per confrontare i due
-# metodi servono due sessioni separate, non uno switch a runtime.
+# THE SWITCH — decides which of the two architectures to use for the whole
+# session. Change this, rebuild, test; comparing the two methods takes
+# two separate sessions, not a run-time switch.
 # ============================================================
-TRACKING_METHOD = "embedding_only"  # "botsort_hsv" oppure "embedding_only"
+TRACKING_METHOD = "embedding_only"  # "botsort_hsv" or "embedding_only"
 
 # ============================================================
-# Valori scritti qui, nessun argomento da terminale.
+# Values written here, no command-line arguments.
 # ============================================================
 HAND_RGB_TOPIC = 'camera/hand/compressed'
-HAND_RGB_COMPRESSED = True   # True su bag, False sul robot vero se manca il nodo di ricompressione
+HAND_RGB_COMPRESSED = True   # True on bags, False on the real robot if the recompression node is missing
 HAND_CAMERA_INFO_TOPIC = '/camera/hand/camera_info'
-HAND_DEPTH_TOPIC = '/depth/hand/image'   # depth ToF della camera del braccio — verifica il nome reale
+HAND_DEPTH_TOPIC = '/depth/hand/image'   # ToF depth of the arm camera — check the real name
 GOAL_FRAME = 'odom'
 
 TARGET_POSE_TOPIC = 'target_info'
 
 DETECT_SERVICE = 'detect'
 TARGET_CLASSES = ['person','quadruped','quadruped animal','quadruped robot','robotic dog','four-legged robot', 'dog', 'robot','umanoid robot']
-DEBUG_IMAGE_TOPIC = '/person_follow/hand_debug/compressed'  # suffisso /compressed: convenzione
-                                                               # image_transport, stessa di /camera/hand/compressed
+DEBUG_IMAGE_TOPIC = '/person_follow/hand_debug/compressed'  # /compressed suffix: image_transport
+                                                               # convention, same as /camera/hand/compressed
 
-REID_SIMILARITY_THRESHOLD = 0.60  # soglia minima di similarita' per essere candidato
-MIN_DETECTION_CONFIDENCE = 0.10   # confidenza MINIMA della detection di YOLOE stessa (non l'aspetto)
+REID_SIMILARITY_THRESHOLD = 0.60  # minimum similarity threshold to be a candidate
+MIN_DETECTION_CONFIDENCE = 0.10   # MINIMUM confidence of the YOLOE detection itself (not the appearance)
 REID_EMA_ALPHA = 0.3
-TARGET_DISTANCE_THRESHOLD_FRAC = 0.30  # quanto puo' spostarsi (in pixel, come frazione della
-                                         # diagonale immagine) il target da un frame all'altro
-STABILITY_FRAMES_REQUIRED = 10    # frame consecutivi "stabili" prima di agganciare in SEARCH
-TRACKING_GRACE_FRAMES = 30        # in TRACKING: frame di tentativo prima di passare a RECOVERY
-RECOVERY_TIMEOUT_SEC = 15.0       # in RECOVERY: secondi di tempo REALE prima di arrendersi
-REACQUISITION_STABILITY_FRAMES = 3   # tentativi consecutivi per confermare un riaggancio
-REACQUISITION_PX_TOLERANCE = 60.0    # spostamento massimo tra tentativi per "stesso candidato"
+TARGET_DISTANCE_THRESHOLD_FRAC = 0.30  # how far the target can move (in pixels, as a fraction of
+                                         # the image diagonal) from one frame to the next
+STABILITY_FRAMES_REQUIRED = 10    # consecutive "stable" frames before locking in SEARCH
+TRACKING_GRACE_FRAMES = 30        # in TRACKING: attempt frames before switching to RECOVERY
+RECOVERY_TIMEOUT_SEC = 15.0       # in RECOVERY: seconds of REAL time before giving up
+REACQUISITION_STABILITY_FRAMES = 3   # consecutive attempts to confirm a re-lock
+REACQUISITION_PX_TOLERANCE = 60.0    # maximum movement between attempts to count as "same candidate"
 STOPPING_DISTANCE = 1.0
 
-REID_COMBINE = 0.40  # soglia minima sul punteggio del VINCITORE (best_score)
+REID_COMBINE = 0.40  # minimum threshold on the WINNER's score (best_score)
 
 W_SIMILARITY = 0.7
 W_POSITION = 0.3
@@ -168,7 +169,7 @@ class TrackingFSM(Node):
 
         self._led_lock = threading.Lock()
         self._led_desired_state = None
-        self._led_applied_name = None   # behavior attualmente in esecuzione sul robot
+        self._led_applied_name = None   # behavior currently running on the robot
         self._led_wake = threading.Event()
         self._led_stop = threading.Event()
         self._led_thread = None
@@ -176,7 +177,7 @@ class TrackingFSM(Node):
             self._led_thread = threading.Thread(target=self._led_worker, daemon=True)
             self._led_thread.start()
 
-        # ---------------- Percezione ----------------
+        # ---------------- Perception ----------------
         self.goal_frame = GOAL_FRAME
         self.fov_rad = math.radians(CONE_FOV_DEG)
         self.min_range = CONE_MIN_RANGE
@@ -188,40 +189,40 @@ class TrackingFSM(Node):
         self._latest_depth_image = None
         self._last_image_cb_time = None
 
-        self._last_response_time = None  # time.monotonic() dell'ultima risposta ricevuta dal servizio Detect
+        self._last_response_time = None  # time.monotonic() of the last response received from the Detect service
 
-        # "Blocchiamo tutto": camera_info, depth e image sono nello stesso
-        # gruppo — quando _image_cb resta bloccata ad aspettare la risposta
-        # del servizio Detect (call_sync, sincrona), anche gli aggiornamenti
-        # di depth/camera_info si accodano e aspettano il loro turno.
+        # "We block everything": camera_info, depth and image are in the same
+        # group — while _image_cb is blocked waiting for the response of the
+        # Detect service (call_sync, synchronous), depth/camera_info updates
+        # are queued too and wait for their turn.
         #
-        # Il client del servizio DEVE stare in un gruppo diverso — altrimenti
-        # la risposta non potrebbe mai essere elaborata mentre _image_cb e'
-        # bloccata ad aspettarla (deadlock, non solo un rallentamento).
+        # The service client MUST be in a different group — otherwise the
+        # response could never be processed while _image_cb is blocked
+        # waiting for it (deadlock, not just a slowdown).
         self._main_group = MutuallyExclusiveCallbackGroup()
         self._service_group = ReentrantCallbackGroup()
 
         self.detect_client = DetectClient(self, DETECT_SERVICE, callback_group=self._service_group)
 
         self.state = INIT
-        self.reference_embedding = None  # HSV in botsort_hsv, vettore neurale in embedding_only
+        self.reference_embedding = None  # HSV in botsort_hsv, neural vector in embedding_only
         self.last_target_base = None
         self.last_published_pos = None
         self.last_published_time = 0.0
 
-        self._locked_box = None  # ultimo box confermato — usato da entrambi i metodi
-        self._locked_track_id = -1  # SOLO botsort_hsv: track_id del target agganciato
+        self._locked_box = None  # last confirmed box — used by both methods
+        self._locked_track_id = -1  # botsort_hsv ONLY: track_id of the locked target
 
         self._stability_count = 0
-        self._stability_track_id = -1              # SOLO botsort_hsv
-        self._stability_reference_embedding = None  # SOLO embedding_only (confronto col frame precedente)
+        self._stability_track_id = -1              # botsort_hsv ONLY
+        self._stability_reference_embedding = None  # embedding_only ONLY (comparison with the previous frame)
 
-        self._tracking_miss_count = 0   # frame consecutivi di tentativo IN TRACKING, entrambi i metodi
-        self._recovery_deadline = None  # time.monotonic() oltre il quale RECOVERY si arrende
-        self._reacquisition_pending_box = None  # candidato in corso di conferma (vedi _confirm_reacquisition)
+        self._tracking_miss_count = 0   # consecutive attempt frames IN TRACKING, both methods
+        self._recovery_deadline = None  # time.monotonic() after which RECOVERY gives up
+        self._reacquisition_pending_box = None  # candidate being confirmed (see _confirm_reacquisition)
         self._reacquisition_count = 0
 
-        self._pending_tracker_reset = False  # SOLO botsort_hsv
+        self._pending_tracker_reset = False  # botsort_hsv ONLY
 
         self._start_trigger_thread()
 
@@ -252,11 +253,11 @@ class TrackingFSM(Node):
         self._request_led_state(self.state)
 
     # ==================================================================
-    # LED di Spot — thread dedicato, mai chiamate gRPC dentro _image_cb
+    # Spot LEDs — dedicated thread, never gRPC calls inside _image_cb
     # ==================================================================
     def _request_led_state(self, state):
-        """Chiamata dalla FSM (costo nullo): registra lo stato desiderato e
-        sveglia il worker. Nessuna chiamata di rete qui."""
+        """Called by the FSM (zero cost): records the desired state and
+        wakes up the worker. No network call here."""
         if self.audio_visual_client is None:
             return
         with self._led_lock:
@@ -266,17 +267,17 @@ class TrackingFSM(Node):
         self._led_wake.set()
 
     def _led_worker(self):
-        """Lancia sul robot il behavior associato allo stato corrente e lo
-        rinnova periodicamente. Al cambio di stato ferma il behavior
-        precedente e avvia il nuovo."""
-        # run_behavior converte i tempi in tempo-robot: serve la time sync.
+        """Runs on the robot the behavior mapped to the current state and
+        renews it periodically. On a state change it stops the previous
+        behavior and starts the new one."""
+        # run_behavior converts times to robot time: time sync is required.
         try:
             self.robot.time_sync.wait_for_sync(timeout_sec=10.0)
         except Exception as ex:
             self.get_logger().error(f"[LED] time sync con il robot non stabilita: {ex} — LED disattivati.")
             return
 
-        # Verifica una volta sola che i nomi configurati esistano sul robot.
+        # Check once that the configured names exist on the robot.
         try:
             available = {live.name: live for live in self.audio_visual_client.list_behaviors()}
         except Exception as ex:
@@ -305,7 +306,7 @@ class TrackingFSM(Node):
                 desired_state = self._led_desired_state
             name = STATI_LED.get(desired_state)
             if name is not None and name not in available:
-                name = None  # nome sbagliato: gia' segnalato all'avvio, non riproviamo ogni volta
+                name = None  # wrong name: already reported at start-up, do not retry every time
 
             now = time.time()
             try:
@@ -321,11 +322,11 @@ class TrackingFSM(Node):
                     self.audio_visual_client.run_behavior(name, now + LED_DURATION_SEC, restart=False)
                     last_run = now
             except Exception as ex:
-                # _led_applied_name non aggiornato in caso di errore: al prossimo giro riprova.
+                # _led_applied_name is not updated on error: retry on the next round.
                 self.get_logger().error(f"[LED] aggiornamento fallito: {ex}", throttle_duration_sec=5.0)
 
     def shutdown_leds(self):
-        """Ferma il worker e il behavior in corso sul robot."""
+        """Stops the worker and the behavior running on the robot."""
         self._led_stop.set()
         self._led_wake.set()
         if self._led_thread is not None:
@@ -338,16 +339,16 @@ class TrackingFSM(Node):
 
     # ==================================================================
     def _start_trigger_thread(self):
-        """Avvia (o riavvia) il thread che aspetta INVIO. Un thread Python
-        non e' riavviabile una volta terminato — per questo, ogni volta che
-        serve un nuovo trigger se ne crea uno nuovo."""
+        """Starts (or restarts) the thread waiting for ENTER. A Python
+        thread cannot be restarted once finished — that is why a new one
+        is created every time a new trigger is needed."""
         self._manual_trigger_received = False
         self._stdin_thread = threading.Thread(target=self._wait_for_manual_trigger, daemon=True)
         self._stdin_thread.start()
 
     def _enter_waiting_trigger(self):
-        """Torna in WAITING_TRIGGER — chiamato quando RECOVERY scade senza
-        ritrovare il target. Richiede di premere di nuovo INVIO."""
+        """Goes back to WAITING_TRIGGER — called when RECOVERY expires
+        without finding the target again. Requires pressing ENTER again."""
         self.state = WAITING_TRIGGER
         self._locked_box = None
         self._locked_track_id = -1
@@ -379,9 +380,9 @@ class TrackingFSM(Node):
         self._latest_depth_image = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding='passthrough')
 
     def _publish_target_info(self, box_full, dist, header):
-        """Pubblica le informazioni del target (bounding box, distanza)."""
+        """Publishes the target information (bounding box, distance)."""
         if box_full is None or dist is None:
-            return  # nessun target valido: non pubblichiamo nulla
+            return  # no valid target: publish nothing
 
         if self._last_response_time is not None:
             elapsed_ms = (time.monotonic() - self._last_response_time) * 1000.0
@@ -397,12 +398,12 @@ class TrackingFSM(Node):
         self.target_pose_pub.publish(target_info_msg)
 
     # ------------------------------------------------------------------
-    # Dispatch per stato — il debug e' costruito e pubblicato SEMPRE
-    # (tutti gli stati), la detection gira SOLO in SEARCH/TRACKING/RECOVERY.
+    # Per-state dispatch — the debug image is built and published ALWAYS
+    # (every state), detection runs ONLY in SEARCH/TRACKING/RECOVERY.
     # ------------------------------------------------------------------
     def _image_cb(self, rgb_msg):
-        # Due orologi SEPARATI: time.time() solo per confrontarsi con lo
-        # stamp ROS (queue delay); time.monotonic() per tutti i timing interni.
+        # Two SEPARATE clocks: time.time() only to compare against the
+        # ROS stamp (queue delay); time.monotonic() for all internal timings.
         t_wall = time.time()
         t_start = time.monotonic()
 
@@ -415,7 +416,7 @@ class TrackingFSM(Node):
         since_last = (t_start - self._last_image_cb_time) * 1000.0 if self._last_image_cb_time else -1.0
         self._last_image_cb_time = t_start
 
-        # LED: registra solo lo stato desiderato (nessuna chiamata di rete qui).
+        # LED: only record the desired state (no network call here).
         self._request_led_state(self.state)
 
         if HAND_RGB_COMPRESSED:
@@ -447,7 +448,7 @@ class TrackingFSM(Node):
             f"crop+disegno={(t_crop_draw - t_decode) * 1000:.0f}ms  (stato={self.state}, crop_rect={crop_rect})",
             throttle_duration_sec=1.0)
 
-        # ---- INIT: aspetta intrinseci + servizio Detect pronto ----
+        # ---- INIT: wait for intrinsics + Detect service ready ----
         if self.state == INIT:
             if self.intrinsics is not None and self.detect_client.client.service_is_ready():
                 self.get_logger().info(
@@ -457,7 +458,7 @@ class TrackingFSM(Node):
             self._publish_debug(debug_frame, rgb_msg.header)
             return
 
-        # ---- WAITING_TRIGGER: aspetta INVIO ----
+        # ---- WAITING_TRIGGER: wait for ENTER ----
         if self.state == WAITING_TRIGGER:
             if self._manual_trigger_received:
                 self.get_logger().info("Trigger manuale ricevuto — passo a SEARCH.")
@@ -465,7 +466,7 @@ class TrackingFSM(Node):
             self._publish_debug(debug_frame, rgb_msg.header)
             return
 
-        # ---- SEARCH / TRACKING / RECOVERY: qui gira la detection, sul crop — CHIAMATA BLOCCANTE ----
+        # ---- SEARCH / TRACKING / RECOVERY: detection runs here, on the crop — BLOCKING CALL ----
         if crop_rect is None:
             self.get_logger().info(
                 f"{self.state.upper()}: ROI non calcolabile questo frame (intrinseci non ancora pronti) — "
@@ -503,12 +504,12 @@ class TrackingFSM(Node):
             self.get_logger().error(f"Eccezione nell'elaborazione della risposta: {ex}", throttle_duration_sec=2.0)
             self._publish_debug(debug_frame, rgb_msg.header)
 
-        # Stato eventualmente cambiato durante l'elaborazione: aggiorna subito i LED.
+        # State possibly changed during processing: update the LEDs right away.
         self._request_led_state(self.state)
 
     # ====================================================================
-    # METODO "botsort_hsv" — identita' via track_id (BoT-SORT), HSV come
-    # rete di sicurezza SOLO quando il track_id sparisce.
+    # METHOD "botsort_hsv" — identity via track_id (BoT-SORT), HSV as a
+    # safety net ONLY when the track_id disappears.
     # ====================================================================
 
     def _handle_search_response_botsort(self, response, frame_bgr, crop_rect, debug_frame, header):
@@ -596,7 +597,7 @@ class TrackingFSM(Node):
         self._publish_debug(debug_frame, header)
 
     def _attempt_reacquisition_botsort(self, response, frame_bgr, crop_rect, depth_image, debug_frame):
-        """SOLO istogramma HSV (mai neurale)."""
+        """HSV histogram ONLY (never neural)."""
         if response is None:
             return None, -1, None, None
 
@@ -647,7 +648,7 @@ class TrackingFSM(Node):
                             det.x2 + crop_rect[0], det.y2 + crop_rect[1])
                 self._draw_box(debug_frame, box_full, (100, 100, 100), f"{det.class_name} det pre CONFIDENCE check BOTSORT_TRACKING id {det.track_id}", label_offset=3)
 
-        # ---- PERCORSO VELOCE ----
+        # ---- FAST PATH ----
         fast_det = None
         crop_x1, crop_y1, _, _ = crop_rect
         if response is not None and self._locked_track_id != -1:
@@ -685,7 +686,7 @@ class TrackingFSM(Node):
             self._publish_debug(debug_frame, header)
             return
 
-        # ---- Il track_id agganciato NON c'e': tentativo con HSV ----
+        # ---- The locked track_id is NOT there: attempt with HSV ----
         best_box, best_track_id, best_dist_m, best_score = self._attempt_reacquisition_botsort(
             response, frame_bgr, crop_rect, depth_image, debug_frame)
 
@@ -789,13 +790,13 @@ class TrackingFSM(Node):
         self._publish_debug(debug_frame, header)
 
     # ====================================================================
-    # METODO "embedding_only" — identita' SOLO via embedding neurale, in
-    # OGNI stato (SEARCH compreso). Nessun track_id/BoT-SORT coinvolto.
+    # METHOD "embedding_only" — identity ONLY via neural embedding, in
+    # EVERY state (SEARCH included). No track_id/BoT-SORT involved.
     # ====================================================================
 
     def _handle_search_response_embedding(self, response, frame_bgr, crop_rect, debug_frame, header):
 
-        self.reference_embedding = None  # in SEARCH non ci fidiamo di nessun embedding precedente — serve un candidato stabile nuovo
+        self.reference_embedding = None  # in SEARCH we do not trust any previous embedding — a new stable candidate is needed
         if response is None:
             self._publish_debug(debug_frame, header)
             return
@@ -879,7 +880,7 @@ class TrackingFSM(Node):
             self._publish_debug(debug_frame, header)
             return
 
-        # Stabile per abbastanza frame: aggancio.
+        # Stable for enough frames: lock.
         self.reference_embedding = box_embedding
         self._locked_box = box_full
         self._publish_target_info(box_full, dist, header)
@@ -891,8 +892,8 @@ class TrackingFSM(Node):
         self._publish_debug(debug_frame, header)
 
     def _attempt_reacquisition_embedding(self, response, frame_bgr, crop_rect, depth_image, debug_frame):
-        """SOLO embedding neurale (mai HSV, mai track_id). best_score
-        ritornato = punteggio COMBINATO (confrontato poi con REID_COMBINE)."""
+        """Neural embedding ONLY (never HSV, never track_id). The returned
+        best_score = COMBINED score (then compared with REID_COMBINE)."""
         if response is None:
             return None, None, None, None
 
@@ -1056,12 +1057,12 @@ class TrackingFSM(Node):
         self._publish_debug(debug_frame, header)
 
     # ------------------------------------------------------------------
-    # Comune a entrambi i metodi
+    # Shared by both methods
     # ------------------------------------------------------------------
     def _confirm_reacquisition(self, candidate_box):
-        """Lo STESSO candidato (per posizione) deve essere il migliore
-        match per REACQUISITION_STABILITY_FRAMES tentativi di fila prima di
-        essere confermato come il target ritrovato."""
+        """The SAME candidate (by position) must be the best match for
+        REACQUISITION_STABILITY_FRAMES attempts in a row before being
+        confirmed as the recovered target."""
         candidate_center = box_center(candidate_box)
         if (self._reacquisition_pending_box is not None
                 and distance(candidate_center, box_center(self._reacquisition_pending_box))
@@ -1083,9 +1084,9 @@ class TrackingFSM(Node):
 
     @staticmethod
     def _draw_box(frame, box, color, label, label_offset=0):
-        # Senza nessuno iscritto al topic di debug il frame e' None: niente
-        # da disegnare. Senza questo controllo, chiudere rqt faceva
-        # eccezione a ogni frame e bloccava il tracking.
+        # With nobody subscribed to the debug topic the frame is None:
+        # nothing to draw. Without this check, closing rqt raised an
+        # exception on every frame and blocked tracking.
         if frame is None or box is None:
             return
         x1, y1, x2, y2 = [int(v) for v in box]
@@ -1116,8 +1117,8 @@ class TrackingFSM(Node):
 def main():
     rclpy.init()
 
-    # 1. SDK Spot (le versioni recenti registrano gia' AudioVisualClient;
-    #    la registrazione esplicita resta innocua per quelle piu' vecchie)
+    # 1. Spot SDK (recent versions already register AudioVisualClient;
+    #    the explicit registration stays harmless for older ones)
     sdk = bosdyn.client.create_standard_sdk('TrackingFSM_LED_Client')
     sdk.register_service_client(AudioVisualClient)
 
@@ -1125,13 +1126,13 @@ def main():
     robot_ip = "192.168.80.3"
     robot = sdk.create_robot(robot_ip)
 
-    # 3. Credenziali
+    # 3. Credentials
     SPOT_USERNAME = "admin"
     SPOT_PASSWORD = "prb4e3wparqx"
 
     try:
         robot.authenticate(SPOT_USERNAME, SPOT_PASSWORD)
-        robot.start_time_sync()   # necessaria: run_behavior converte i tempi in tempo-robot
+        robot.start_time_sync()   # required: run_behavior converts times to robot time
         print("[SDK SPOT] Connessione gRPC per i LED inizializzata con successo.")
     except Exception as e:
         print(f"[ERRORE SDK SPOT] Impossibile autenticarsi sul robot per i LED: {e}")
@@ -1140,9 +1141,9 @@ def main():
 
     node = TrackingFSM(robot=robot)
 
-    # MultiThreadedExecutor OBBLIGATORIO: permette al gruppo del client
-    # (self._service_group) di elaborare la risposta del servizio Detect
-    # mentre _image_cb (self._main_group) e' bloccata in call_sync().
+    # MultiThreadedExecutor is MANDATORY: it lets the client group
+    # (self._service_group) process the Detect service response
+    # while _image_cb (self._main_group) is blocked in call_sync().
     executor = MultiThreadedExecutor(num_threads=4)
     executor.add_node(node)
     try:

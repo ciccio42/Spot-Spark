@@ -3,7 +3,7 @@
 <package format="3">
   <name>detector_interfaces</name>
   <version>0.0.1</version>
-  <description>Interfacce (msg/srv) per il servizio di detection YOLOE nel container yolo.</description>
+  <description>Interfaces (msg/srv) for the YOLOE detection service in the yolo container.</description>
   <maintainer email="you@example.com">tuo_nome</maintainer>
   <license>Apache-2.0</license>
 

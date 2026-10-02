@@ -2,32 +2,32 @@
 """
 costmap_refresher.py (spot_motion)
 
-Svuota periodicamente uno o piu' costmap chiamando il servizio
-ClearEntireCostmap di Nav2, SEMPRE: anche a robot fermo, in HOLD (rotazione
-sul posto), con goal da RViz o senza nessuna navigazione attiva.
+Periodically clears one or more costmaps by calling the Nav2
+ClearEntireCostmap service, ALWAYS: even with the robot standing still, in
+HOLD (rotating in place), with a goal from RViz or with no navigation active.
 
-PERCHE' UN NODO A PARTE (e non nel Behavior Tree)
-  Il BT gira solo durante una NavigateToPose. Quando il robot e' fermo non
-  viene eseguito, quindi un refresh messo li' si fermerebbe proprio quando
-  serve. Questo nodo e' indipendente da navigazione e following.
+WHY A SEPARATE NODE (and not in the Behavior Tree)
+  The BT only runs during a NavigateToPose. When the robot is still it is
+  not executed, so a refresh placed there would stop exactly when it is
+  needed. This node is independent of navigation and following.
 
-COSA COPRE
-  Gli ostacoli rimasti FUORI dal campo visivo delle camere frontali (es. una
-  persona passata di lato): nessun raggio puo' pulirli, quindi senza refresh
-  resterebbero finche' non escono dalla finestra del costmap.
-  Dentro il campo visivo il refresh continuo lo fanno gia' le sorgenti
-  clear_frontleft / clear_frontright del YAML, a ogni nuvola.
+WHAT IT COVERS
+  Obstacles left OUTSIDE the field of view of the front cameras (e.g. a
+  person who walked past on the side): no ray can clear them, so without a
+  refresh they would stay until they leave the costmap window.
+  Inside the field of view the continuous refresh is already done by the
+  clear_frontleft / clear_frontright sources in the YAML, on every cloud.
 
-DOPO OGNI REFRESH gli ostacoli reali davanti al robot ricompaiono alla nuvola
-successiva (~0.3-0.5 s); quelli laterali quando le camere li rivedono.
+AFTER EACH REFRESH the real obstacles in front of the robot reappear with the
+next cloud (~0.3-0.5 s); the lateral ones when the cameras see them again.
 
-PARAMETRI
-  period    secondi tra due refresh (default 2.0)
-  services  lista dei servizi da chiamare
-            (default: solo il costmap locale; il globale serve al planner per
-             ricordare gli ostacoli gia' superati, meglio non svuotarlo spesso)
+PARAMETERS
+  period    seconds between two refreshes (default 2.0)
+  services  list of the services to call
+            (default: only the local costmap; the planner needs the global
+             one to remember obstacles already passed, better not to clear it often)
 
-Uso:
+Usage:
   ros2 run spot_motion costmap_refresher
   ros2 run spot_motion costmap_refresher --ros-args -p period:=1.0
 """
@@ -46,7 +46,7 @@ class CostmapRefresher(Node):
         names = list(self.get_parameter('services').value)
 
         self.clients_ = {n: self.create_client(ClearEntireCostmap, n) for n in names}
-        self.pending = {n: None for n in names}      # una sola richiesta in volo per servizio
+        self.pending = {n: None for n in names}      # only one request in flight per service
         self.ok_logged = {n: False for n in names}
 
         self.create_timer(self.period, self._refresh)
@@ -60,7 +60,7 @@ class CostmapRefresher(Node):
                 continue
             fut = self.pending[name]
             if fut is not None and not fut.done():
-                continue  # la richiesta precedente non e' ancora tornata: non accodarne altre
+                continue  # the previous request has not returned yet: do not queue more
             fut = client.call_async(ClearEntireCostmap.Request())
             fut.add_done_callback(lambda f, n=name: self._on_done(n, f))
             self.pending[name] = fut

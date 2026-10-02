@@ -2,12 +2,12 @@
 """
 common.py (demo_package)
 
-Funzioni geometriche, di lettura depth e di ReID leggero usate da
-tracking_fsm.py (design a camera singola: solo braccio). Nessuna
-dipendenza da rclpy NE' da ultralytics/YOLOE: la detection vera passa dal
-servizio Detect (vedi detect_client.py) esposto dal DetectorNode nel
-container yolo — qui restano solo le funzioni "pure" che non dipendono da
-come viene fatta la detection.
+Geometry, depth-reading and lightweight ReID functions used by
+tracking_fsm.py (single-camera design: arm only). No dependency on rclpy
+NOR on ultralytics/YOLOE: the actual detection goes through the Detect
+service (see detect_client.py) exposed by the DetectorNode in the yolo
+container — only the "pure" functions that do not depend on how the
+detection is done remain here.
 """
 
 import math
@@ -17,23 +17,23 @@ import numpy as np
 
 
 # ============================================================
-# ROI — UNICA fonte di verita'. Cambia i valori qui, si applicano
-# automaticamente sia al crop (compute_roi_crop_rect) sia al controllo di
-# distanza post-detection in tracking_fsm.py.
+# ROI — SINGLE source of truth. Change the values here; they automatically
+# apply both to the crop (compute_roi_crop_rect) and to the post-detection
+# distance check in tracking_fsm.py.
 # ============================================================
-CONE_FOV_DEG = 35.0        # apertura TOTALE della ROI, in gradi — larghezza del crop (via intrinseci)
-CONE_MIN_RANGE = 1.5       # distanza minima, in metri (controllo POST-detection, via depth)
-CONE_MAX_RANGE = 3.5       # distanza massima, in metri (controllo POST-detection, via depth)
-CROP_TOP_MARGIN_FRAC = 0   # frazione dell'altezza immagine tagliata dall'ALTO nel crop
-CROP_BOTTOM_MARGIN_FRAC = 0  # frazione dell'altezza immagine tagliata dal BASSO nel crop
-                                  # Nessun significato fisico ("altezza da terra") — puramente
-                                  # pixel: il target deve solo cadere DENTRO il crop, la distanza
-                                  # vera si verifica DOPO sulla depth del box (box_center_depth),
-                                  # non sul crop stesso. Nessuna TF coinvolta.
+CONE_FOV_DEG = 35.0        # TOTAL ROI aperture, in degrees — crop width (via intrinsics)
+CONE_MIN_RANGE = 1.5       # minimum distance, in metres (POST-detection check, via depth)
+CONE_MAX_RANGE = 3.5       # maximum distance, in metres (POST-detection check, via depth)
+CROP_TOP_MARGIN_FRAC = 0   # fraction of the image height cut from the TOP in the crop
+CROP_BOTTOM_MARGIN_FRAC = 0  # fraction of the image height cut from the BOTTOM in the crop
+                                  # No physical meaning ("height above ground") — purely
+                                  # pixels: the target only has to fall INSIDE the crop, the real
+                                  # distance is checked AFTERWARDS on the box depth (box_center_depth),
+                                  # not on the crop itself. No TF involved.
 
 
 # ============================================================
-# Geometria 2D/3D
+# 2D/3D geometry
 # ============================================================
 
 def box_center(box):
@@ -42,15 +42,15 @@ def box_center(box):
 
 
 def distance(p1, p2):
-    """Distanza euclidea; funziona sia per punti 2D che 3D (tuple della
-    stessa lunghezza)."""
+    """Euclidean distance; works for both 2D and 3D points (tuples of the
+    same length)."""
     return math.sqrt(sum((a - b) ** 2 for a, b in zip(p1, p2)))
 
 
 def deproject_pixel_to_point(u, v, depth, fx, fy, cx, cy):
-    """Modello pinhole inverso: pixel (u, v) + profondita' (metri) -> punto
-    3D nel frame OTTICO della camera (x destra, y basso, z avanti —
-    convenzione standard OpenCV/ROS)."""
+    """Inverse pinhole model: pixel (u, v) + depth (metres) -> 3D point in
+    the camera OPTICAL frame (x right, y down, z forward — standard
+    OpenCV/ROS convention)."""
     x = (u - cx) * depth / fx
     y = (v - cy) * depth / fy
     z = depth
@@ -58,8 +58,8 @@ def deproject_pixel_to_point(u, v, depth, fx, fy, cx, cy):
 
 
 def project_point_to_pixel(x, y, z, fx, fy, cx, cy):
-    """Proiezione pinhole diretta: punto 3D nel frame ottico della camera ->
-    pixel (u, v). None se il punto e' dietro la camera (z <= 0)."""
+    """Forward pinhole projection: 3D point in the camera optical frame ->
+    pixel (u, v). None if the point is behind the camera (z <= 0)."""
     if z <= 1e-6:
         return None
     u = fx * x / z + cx
@@ -68,8 +68,8 @@ def project_point_to_pixel(x, y, z, fx, fy, cx, cy):
 
 
 class CameraIntrinsics:
-    """Estrae fx, fy, cx, cy dalla matrice K (row-major 3x3) di un messaggio
-    sensor_msgs/CameraInfo. In ROS2 il campo si chiama 'k' (minuscolo)."""
+    """Extracts fx, fy, cx, cy from the K matrix (row-major 3x3) of a
+    sensor_msgs/CameraInfo message. In ROS 2 the field is called 'k' (lowercase)."""
 
     __slots__ = ("fx", "fy", "cx", "cy")
 
@@ -86,19 +86,19 @@ class CameraIntrinsics:
 # ============================================================
 
 def box_center_depth(depth_image, box, patch_frac=0.2, min_patch_px=3, min_valid_pixels=3):
-    """Profondita' (mediana, in metri) su una PICCOLA porzione centrata sul
-    box — non tutto il box, non un singolo pixel puro.
+    """Depth (median, in metres) over a SMALL patch centred on the box —
+    not the whole box, not a single pixel.
 
-    Perche' non tutto il box: se il box non e' stretto attorno al soggetto
-    (comune con YOLOE), i pixel di sfondo ai bordi contaminano la mediana,
-    spostando la distanza calcolata verso quella dello sfondo.
+    Why not the whole box: if the box is not tight around the subject
+    (common with YOLOE), the background pixels at the edges contaminate the
+    median, pulling the computed distance towards the background.
 
-    Perche' non un singolo pixel: i sensori depth hanno spesso buchi in
-    punti isolati (rumore, riflessi) — un solo pixel sfortunato darebbe
-    None anche con il soggetto perfettamente visibile li'.
+    Why not a single pixel: depth sensors often have holes at isolated
+    points (noise, reflections) — one unlucky pixel would give None even
+    with the subject perfectly visible there.
 
-    `patch_frac`: frazione della larghezza/altezza del box da campionare,
-    centrata. Con patch_frac=0.2 su un box 100x200px, la patch e' 20x40px."""
+    `patch_frac`: fraction of the box width/height to sample, centred.
+    With patch_frac=0.2 on a 100x200px box, the patch is 20x40px."""
     h, w = depth_image.shape[:2]
     x1, y1, x2, y2 = box
     cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
@@ -125,11 +125,11 @@ def box_center_depth(depth_image, box, patch_frac=0.2, min_patch_px=3, min_valid
 
 
 def scale_box_to_depth(box, rgb_shape, depth_shape):
-    """Riscala le coordinate di un box (in pixel dell'immagine RGB su cui e'
-    girata la detection) alla risoluzione dell'immagine di depth, se le due
-    hanno dimensioni diverse — comune con sensori ToF, spesso a
-    risoluzione nettamente minore della camera RGB. Se le due risoluzioni
-    combaciano, ritorna il box invariato."""
+    """Rescales the coordinates of a box (in pixels of the RGB image the
+    detection ran on) to the resolution of the depth image, if the two have
+    different sizes — common with ToF sensors, often at a much lower
+    resolution than the RGB camera. If the two resolutions match, returns
+    the box unchanged."""
     rgb_h, rgb_w = rgb_shape[:2]
     depth_h, depth_w = depth_shape[:2]
     if (rgb_w, rgb_h) == (depth_w, depth_h):
@@ -141,7 +141,7 @@ def scale_box_to_depth(box, rgb_shape, depth_shape):
 
 
 # ============================================================
-# Aspetto (ReID leggero) — stessa logica di yoloe_offline_reid.py
+# Appearance (lightweight ReID) — same logic as yoloe_offline_reid.py
 # ============================================================
 
 def extract_appearance_embedding(frame_bgr, box, hist_bins=(8, 8, 8)):
@@ -159,31 +159,31 @@ def extract_appearance_embedding(frame_bgr, box, hist_bins=(8, 8, 8)):
 
 
 def embedding_similarity(e1, e2):
-    """Similarita' in [-1, 1] (1 = identico). 0.0 se manca un embedding.
-    Per l'istogramma HSV di extract_appearance_embedding — vedi
-    neural_embedding_similarity per il nuovo embedding neurale (da
-    detector_interfaces/BoxDetection.embedding, campo compilato lato yolo)."""
+    """Similarity in [-1, 1] (1 = identical). 0.0 if an embedding is missing.
+    For the HSV histogram of extract_appearance_embedding — see
+    neural_embedding_similarity for the new neural embedding (from
+    detector_interfaces/BoxDetection.embedding, field filled on the yolo side)."""
     if e1 is None or e2 is None:
         return 0.0
     return float(cv2.compareHist(e1, e2, cv2.HISTCMP_CORREL))
 
 
 def embedding_from_msg(embedding_field):
-    """Converte il campo ROS BoxDetection.embedding (float32[], vuoto se il
-    DetectorNode non aveva un modello di embedding configurato) in un
-    numpy array, o None se e' vuoto — cosi' il chiamante puo' trattare
-    'array vuoto dal messaggio' e 'nessun embedding' con lo stesso
-    controllo (`is None`), senza dover controllare la lunghezza ogni volta."""
+    """Converts the ROS field BoxDetection.embedding (float32[], empty if the
+    DetectorNode had no embedding model configured) into a numpy array, or
+    None if it is empty — so the caller can treat 'empty array from the
+    message' and 'no embedding' with the same check (`is None`), without
+    checking the length every time."""
     if not embedding_field:
         return None
     return np.array(embedding_field, dtype=np.float32)
 
 
 def neural_embedding_similarity(e1, e2):
-    """Similarita' coseno in [-1, 1] (1 = identico) tra due embedding
-    NEURALI (da un modello di classificazione separato, penultimo layer —
-    non l'istogramma HSV, che usa embedding_similarity/HISTCMP_CORREL).
-    0.0 se manca un embedding."""
+    """Cosine similarity in [-1, 1] (1 = identical) between two NEURAL
+    embeddings (from a separate classification model, penultimate layer —
+    not the HSV histogram, which uses embedding_similarity/HISTCMP_CORREL).
+    0.0 if an embedding is missing."""
     if e1 is None or e2 is None:
         return 0.0
     n1 = np.linalg.norm(e1)
@@ -193,7 +193,7 @@ def neural_embedding_similarity(e1, e2):
     return float(np.dot(e1, e2)/(n1 * n2))
 
 def rich_neural_embedding_similarity(e1, e2, w_cosine=1.0, w_euclidean=1.0 , w_magnitude=1.0, euclidean_scale=10.0 , magnitude_scale=10.0):
-    """_Combina la similarità coseno e la distanza euclidea sui vettori grezzi (sensibile anche al modulo non solo alla direzione) in un unico punteggio di similarità. Ritorna 0.0 se manca un embedding."""
+    """Combines cosine similarity and Euclidean distance on the raw vectors (sensitive to magnitude too, not only direction) into a single similarity score. Returns 0.0 if an embedding is missing."""
     
     if e1 is None or e2 is None:
         return 0.0
@@ -203,9 +203,9 @@ def rich_neural_embedding_similarity(e1, e2, w_cosine=1.0, w_euclidean=1.0 , w_m
     
     cosine = float(np.dot(e1, e2) / (n1 * n2)) if n1 > 1e-8 and n2 > 1e-8 else 0.0
     euclidean_dist = np.linalg.norm(e1 - e2)
-    euclidean_sim = 1.0 / (1.0 + euclidean_dist / euclidean_scale)  # Normalizza la distanza euclidea in un punteggio di similarità tra 0 e 1
+    euclidean_sim = 1.0 / (1.0 + euclidean_dist / euclidean_scale)  # Normalise the Euclidean distance into a similarity score between 0 and 1
     magnitude_diff = abs(n1 - n2)
-    magnitude_sim = 1.0 / (1.0 + magnitude_diff / magnitude_scale)  # Normalizza la differenza di magnitudine in un punteggio di similarità
+    magnitude_sim = 1.0 / (1.0 + magnitude_diff / magnitude_scale)  # Normalise the magnitude difference into a similarity score
     total_weight = w_cosine + w_euclidean + w_magnitude
     
     print(f"Cosine: {cosine:.4f}, Euclidean Sim: {euclidean_sim:.4f}, Magnitude Sim: {magnitude_sim:.4f}, Total Weight: {total_weight:.4f}")
@@ -215,27 +215,27 @@ def rich_neural_embedding_similarity(e1, e2, w_cosine=1.0, w_euclidean=1.0 , w_m
 
 
 # ============================================================
-# ROI come crop dell'immagine (design a camera singola: braccio)
+# ROI as an image crop (single-camera design: arm)
 # ============================================================
 
 def compute_roi_crop_rect(image_width, image_height, intrinsics, fov_rad,
                            top_margin_frac=CROP_TOP_MARGIN_FRAC, bottom_margin_frac=CROP_BOTTOM_MARGIN_FRAC):
-    """Calcola il rettangolo di crop (x1, y1, x2, y2) in pixel. NESSUNA TF
-    coinvolta, su nessuno dei due assi:
+    """Computes the crop rectangle (x1, y1, x2, y2) in pixels. NO TF
+    involved, on either axis:
 
-    - LARGHEZZA: dagli intrinseci della camera (fx, cx) e dal FOV, come
-      prima — mezza_larghezza_px = fx * tan(fov_rad / 2).
+    - WIDTH: from the camera intrinsics (fx, cx) and the FOV, as before —
+      half_width_px = fx * tan(fov_rad / 2).
 
-    - ALTEZZA: frazione FISSA dell'immagine, tagliata dall'alto e dal
-      basso. Nessun significato fisico ("altezza da terra") — il target
-      deve solo cadere DENTRO il crop; la distanza/range reale si verifica
-      DOPO, sulla depth del box rilevato (box_center_depth in
-      tracking_fsm.py), non sul crop stesso.
+    - HEIGHT: FIXED fraction of the image, cut from the top and the
+      bottom. No physical meaning ("height above ground") — the target
+      only has to fall INSIDE the crop; the real distance/range is checked
+      AFTERWARDS, on the depth of the detected box (box_center_depth in
+      tracking_fsm.py), not on the crop itself.
 
-    Sempre calcolabile una volta noti gli intrinseci (a differenza della
-    versione precedente, non dipende dalla posa del braccio in quel
-    istante) — ritorna None solo se i margini configurati sono degeneri
-    (es. margini che si sovrappongono)."""
+    Always computable once the intrinsics are known (unlike the previous
+    version, it does not depend on the arm pose at that instant) —
+    returns None only if the configured margins are degenerate (e.g.
+    overlapping margins)."""
     half_width_px = intrinsics.fx * math.tan(fov_rad / 2.0)
     x1 = max(0, int(intrinsics.cx - half_width_px))
     x2 = min(image_width, int(intrinsics.cx + half_width_px))

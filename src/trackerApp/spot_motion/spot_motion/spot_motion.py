@@ -2,62 +2,62 @@
 """
 motion_command_node.py (spot_motion)
 
-Nodo che riceve TargetPose3D (posizione GREZZA del target — non un goal gia'
-scalato — nel frame OTTICO della camera, pubblicata da Pose3DEstimationNode)
-e comanda Spot a:
+Node that receives TargetPose3D (RAW target position — not an already
+scaled goal — in the camera OPTICAL frame, published by Pose3DEstimationNode)
+and commands Spot to:
 
-  1. Restare SEMPRE rivolto verso il target (rotazione, ad ogni messaggio
-     ricevuto).
-  2. Camminare per convergere verso TARGET_DISTANCE, solo avvicinandosi (mai
-     all'indietro) e solo oltre DISTANCE_TOLERANCE di scarto.
+  1. ALWAYS stay facing the target (rotation, on every message received).
+  2. Walk to converge to TARGET_DISTANCE, only moving closer (never
+     backwards) and only beyond a DISTANCE_TOLERANCE error.
 
-CATENA DI FRAME — due transform diversi, presi da due fonti diverse:
-  - body -> wrist (meccanico): LIVE, da kinematic_state.transforms_snapshot
-    (robot_state_client) ad ogni messaggio.
-  - wrist -> camera (ottico): FISSO, preso UNA VOLTA SOLA all'avvio da un
+FRAME CHAIN — two different transforms, taken from two different sources:
+  - body -> wrist (mechanical): LIVE, from kinematic_state.transforms_snapshot
+    (robot_state_client) on every message.
+  - wrist -> camera (optical): FIXED, taken ONCE at start-up from an
     ImageResponse.shot.transforms_snapshot (via ImageClient).
-  I due si compongono: body_tform_camera = body_tform_wrist * wrist_tform_camera.
+  The two are composed: body_tform_camera = body_tform_wrist * wrist_tform_camera.
 
-FILTRO DI KALMAN (velocita' costante, 2 assi indipendenti x/y): smussa la
-posizione del target nel frame ODOM (fisso — MAI il frame body, che si
-muove col robot). Il filtro NON e' l'estrapolazione — l'estrapolazione (vedi
-sotto) LEGGE lo stato del filtro, non lo modifica mai al di fuori di un dato
-vero ricevuto in _on_target_pose.
+KALMAN FILTER (constant velocity, 2 independent axes x/y): smooths the
+target position in the ODOM frame (fixed — NEVER the body frame, which moves
+with the robot). The filter is NOT the extrapolation — the extrapolation
+(see below) READS the filter state, it never modifies it outside of a real
+measurement received in _on_target_pose.
 
-ESTRAPOLAZIONE (_on_timer): gira su un timer INDIPENDENTE dall'arrivo dei
-messaggi — se non arriva un TargetPose3D fresco, proietta in avanti
-l'ultima posizione/velocita' nota del filtro (senza toccare lo stato
-persistente) e manda comunque un comando, cosi' Spot non si ferma di colpo
-per un buco breve. Oltre MAX_EXTRAPOLATION_SEC dall'ultimo dato vero, si
-smette di indovinare — lascia che COMMAND_DURATION fermi Spot. NESSUN
-cambiamento allo stato di tracking_fsm: ci si basa solo sul tempo reale
-trascorso dall'ultimo dato vero, non sullo stato SEARCH/TRACKING/RECOVERY.
+EXTRAPOLATION (_on_timer): runs on a timer INDEPENDENT of message
+arrival — if no fresh TargetPose3D arrives, it projects forward the last
+known position/velocity of the filter (without touching the persistent
+state) and still sends a command, so Spot does not stop abruptly for a
+short gap. Beyond MAX_EXTRAPOLATION_SEC since the last real measurement, it
+stops guessing — letting COMMAND_DURATION stop Spot. NO change to the
+tracking_fsm state: it relies only on the real time elapsed since the last
+real measurement, not on the SEARCH/TRACKING/RECOVERY state.
 
-CONCORRENZA — importante, causa di un blocco osservato in una versione
-precedente: _on_target_pose e _on_timer fanno ENTRAMBI una chiamata di rete
-vera (get_robot_state()). Se girassero sullo stesso thread (l'executor a
-thread singolo di rclpy.spin() di default), l'uno bloccherebbe l'altro ogni
-volta che capitano vicini nel tempo. Stesso identico problema — e stessa
-soluzione — gia' adottata in tracking_fsm.py: due callback group separati
-+ un MultiThreadedExecutor (vedi main()), cosi' le due chiamate possono
-girare su thread diversi senza aspettarsi a vicenda.
+CONCURRENCY — important, the cause of a hang observed in a previous
+version: _on_target_pose and _on_timer BOTH make a real network call
+(get_robot_state()). If they ran on the same thread (the default
+single-threaded executor of rclpy.spin()), one would block the other every
+time they happen close in time. Exactly the same problem — and the same
+solution — already adopted in tracking_fsm.py: two separate callback groups
++ a MultiThreadedExecutor (see main()), so the two calls can run on
+different threads without waiting for each other.
 
-Usa RobotCommandBuilder.synchro_trajectory_command_in_body_frame(): prende
-un goal RELATIVO al corpo (dx, dy, dyaw) + uno snapshot delle trasformazioni,
-e lo converte lei stessa nel frame mondo non mobile (odom, hardcoded).
+Uses RobotCommandBuilder.synchro_trajectory_command_in_body_frame(): it takes
+a goal RELATIVE to the body (dx, dy, dyaw) + a snapshot of the transforms,
+and converts it itself into the non-moving world frame (odom, hard-coded).
 
-VELOCITA': limitata via MobilityParams.vel_limit (MAX_LINEAR_VEL/MAX_ANGULAR_VEL
-qui sotto) — pattern confermato dall'esempio ufficiale Boston Dynamics
+SPEED: limited via MobilityParams.vel_limit (MAX_LINEAR_VEL/MAX_ANGULAR_VEL
+below) — pattern confirmed by the official Boston Dynamics example
 spot_detect_and_follow.py.
 
-Parla direttamente con l'SDK bosdyn — bypassa Nav2 e cmd_vel di spot_ros2.
-spot_driver (se in esecuzione in parallelo) va lanciato con
-auto_claim/auto_power_on/auto_stand a false, cosi' non compete per il lease.
+Talks directly to the bosdyn SDK — bypasses Nav2 and spot_ros2's cmd_vel.
+spot_driver (if running in parallel) must be launched with
+auto_claim/auto_power_on/auto_stand set to false, so it does not compete for
+the lease.
 
-CONFIGURAZIONE: costanti qui sotto, non argomenti da riga di comando.
-ATTENZIONE — SPOT_USERNAME/SPOT_PASSWORD in chiaro sono un'eccezione
-TEMPORANEA per la prova iniziale: vanno spostate su variabile d'ambiente
-(BOSDYN_CLIENT_USERNAME/PASSWORD) prima di qualunque commit.
+CONFIGURATION: constants below, not command-line arguments.
+WARNING — plain-text SPOT_USERNAME/SPOT_PASSWORD are a TEMPORARY exception
+for the initial test: they must be moved to environment variables
+(BOSDYN_CLIENT_USERNAME/PASSWORD) before any commit.
 """
 import math
 import time
@@ -83,58 +83,58 @@ from demo_interfaces.msg import TargetPose3D
 from demo_package.common import CONE_MIN_RANGE
 
 # ============================================================
-# Configurazione — modifica qui, non da riga di comando.
+# Configuration — edit here, not from the command line.
 # ============================================================
-SPOT_HOSTNAME = '192.168.80.3'  # <-- metti l'IP vero del tuo Spot
-SPOT_USERNAME = 'admin'         # <-- SOLO per la prova iniziale, vedi nota sopra
-SPOT_PASSWORD = 'prb4e3wparqx'  #     da spostare su env var prima di qualunque commit
-COMMAND_DURATION = 3.0          # secondi — rete di sicurezza end_time_secs
-DRY_RUN = False                 # True: calcola e logga SENZA mai inviare comandi al robot
+SPOT_HOSTNAME = '192.168.80.3'  # <-- put the real IP of your Spot
+SPOT_USERNAME = 'admin'         # <-- ONLY for the initial test, see note above
+SPOT_PASSWORD = 'prb4e3wparqx'  #     to be moved to an env var before any commit
+COMMAND_DURATION = 3.0          # seconds — end_time_secs safety net
+DRY_RUN = False                 # True: compute and log WITHOUT ever sending commands to the robot
 HAND_CAMERA_IMAGE_SOURCE = 'hand_color_image'
-WRIST_FRAME_NAME = 'arm0.link_wr1'  # verificato: presente in entrambi gli snapshot
-TARGET_DISTANCE = 2.5           # metri — distanza che Spot cerca sempre di mantenere
-DISTANCE_TOLERANCE = 0.15       # metri — sotto questo scarto, resta fermo (solo rotazione)
-MAX_LINEAR_VEL = 0.6   # m/s — molto sotto il massimo hardware di Spot; abbassa se serve
-                         #       ancora piu' lento, il comando non "va veloce" oltre questo
-MAX_ANGULAR_VEL = 0.5  # rad/s — stesso principio per la rotazione
-KF_PROCESS_VAR = 0.05       # rumore di PROCESSO — quanto ci aspettiamo che la velocita' vera del
-                              # target possa cambiare (piu' alto = filtro piu' reattivo a cambi di
-                              # direzione/curve, ma smussa meno il rumore)
-KF_MEASUREMENT_VAR = 0.05   # rumore di MISURA — quanto ci fidiamo della singola bx,by grezza
-                              # (piu' alto = smussa di piu', ma reagisce piu' lentamente ai cambi veri)
-KF_RESET_GAP_SEC = 2.0      # se passa piu' di questo dall'ultimo aggiornamento, il filtro si
-                              # REINIZIALIZZA sulla nuova misura invece di fonderla con uno stato
-                              # ormai troppo vecchio (es. dopo una RECOVERY prolungata)
-EXTRAPOLATION_TIMER_PERIOD = 0.2  # secondi tra un controllo e l'altro quando non arrivano dati
-                                    # freschi — piu' corto dell'intervallo tipico tra due
-                                    # TargetPose3D (~0.3-0.6s), cosi' i buchi si notano in fretta
-MAX_EXTRAPOLATION_SEC = 2.0       # oltre questo tempo SENZA un dato vero, si smette di camminare
-                                    # "alla cieca" — nessun nuovo comando, lascia che
-                                    # COMMAND_DURATION fermi Spot come rete di sicurezza finale.
+WRIST_FRAME_NAME = 'arm0.link_wr1'  # verified: present in both snapshots
+TARGET_DISTANCE = 2.5           # metres — distance Spot always tries to keep
+DISTANCE_TOLERANCE = 0.15       # metres — below this error, stay still (rotation only)
+MAX_LINEAR_VEL = 0.6   # m/s — well below Spot's hardware maximum; lower it if you need
+                         #       it even slower, the command never "goes faster" than this
+MAX_ANGULAR_VEL = 0.5  # rad/s — same principle for rotation
+KF_PROCESS_VAR = 0.05       # PROCESS noise — how much we expect the true velocity of the
+                              # target to change (higher = filter more reactive to changes of
+                              # direction/curves, but smooths noise less)
+KF_MEASUREMENT_VAR = 0.05   # MEASUREMENT noise — how much we trust a single raw bx,by
+                              # (higher = smooths more, but reacts more slowly to real changes)
+KF_RESET_GAP_SEC = 2.0      # if more than this has passed since the last update, the filter is
+                              # RE-INITIALISED on the new measurement instead of merging it with a
+                              # state that is by now too old (e.g. after a long RECOVERY)
+EXTRAPOLATION_TIMER_PERIOD = 0.2  # seconds between two checks when no fresh data
+                                    # arrives — shorter than the typical interval between two
+                                    # TargetPose3D (~0.3-0.6s), so gaps are noticed quickly
+MAX_EXTRAPOLATION_SEC = 2.0       # beyond this time WITHOUT real data, stop walking
+                                    # "blind" — no new command, let COMMAND_DURATION
+                                    # stop Spot as the final safety net.
 # ============================================================
 
 
 def _se2_transform_point(a_tform_b, x, y):
-    """Trasforma un punto (x,y) dal frame b al frame a. SE2Pose non ha un
-    transform_point diretto (a differenza di Quat/SE3Pose, verificato) —
-    lo otteniamo componendo con .mult(), l'unico metodo di composizione
-    confermato: un punto e' una SE2Pose con angle=0, il risultato della
-    composizione ne eredita la posizione trasformata."""
+    """Transforms a point (x,y) from frame b to frame a. SE2Pose has no
+    direct transform_point (unlike Quat/SE3Pose, verified) — we get it by
+    composing with .mult(), the only confirmed composition method: a point
+    is an SE2Pose with angle=0, and the result of the composition inherits
+    its transformed position."""
     result = a_tform_b.mult(math_helpers.SE2Pose(x, y, 0.0))
     return result.x, result.y
 
 
 class _ConstantVelocityKalman1D:
-    """Filtro di Kalman 1D, modello a velocita' costante: stato [pos, vel].
-    Usato due volte (assi x e y indipendenti) per smussare la posizione del
-    target nel frame ODOM (fisso nel mondo — MAI il frame body, che si
-    muove col robot: stimare una velocita' su coordinate che si muovono
-    gia' da sole mescolerebbe il moto del target con quello del robot)."""
+    """1D Kalman filter, constant-velocity model: state [pos, vel].
+    Used twice (independent x and y axes) to smooth the target position in
+    the ODOM frame (fixed in the world — NEVER the body frame, which moves
+    with the robot: estimating a velocity on coordinates that already move
+    by themselves would mix the target motion with the robot motion)."""
 
     def __init__(self, process_var, measurement_var):
         self.pos = 0.0
         self.vel = 0.0
-        self.P = [[1e3, 0.0], [0.0, 1e3]]  # covarianza iniziale alta: non ci fidiamo ancora di nulla
+        self.P = [[1e3, 0.0], [0.0, 1e3]]  # high initial covariance: we do not trust anything yet
         self.q = process_var
         self.r = measurement_var
 
@@ -170,7 +170,7 @@ class MotionCommandNode(Node):
         super().__init__('motion_command_node')
         self.robot_state_client = robot_state_client
         self.robot_command_client = robot_command_client
-        self._wrist_tform_camera = wrist_tform_camera  # fisso, calcolato una volta in main()
+        self._wrist_tform_camera = wrist_tform_camera  # fixed, computed once in main()
         self._command_duration = COMMAND_DURATION
         self._dry_run = DRY_RUN
         self._mobility_params = spot_command_pb2.MobilityParams(
@@ -182,10 +182,10 @@ class MotionCommandNode(Node):
         self._kf_y = _ConstantVelocityKalman1D(KF_PROCESS_VAR, KF_MEASUREMENT_VAR)
         self._kf_last_update_time = None
 
-        # Due callback group separati: senza questo, _on_target_pose e
-        # _on_timer girerebbero sullo stesso thread (default rclpy) e si
-        # bloccherebbero a vicenda ogni volta che entrambi fanno una
-        # chiamata di rete vicine nel tempo — vedi nota in cima al file.
+        # Two separate callback groups: without this, _on_target_pose and
+        # _on_timer would run on the same thread (rclpy default) and would
+        # block each other every time both make a network call close in
+        # time — see the note at the top of the file.
         pose_group = MutuallyExclusiveCallbackGroup()
         timer_group = MutuallyExclusiveCallbackGroup()
 
@@ -210,7 +210,7 @@ class MotionCommandNode(Node):
         bx, by, bz = body_tform_camera.transform_point(
             msg.position.x, msg.position.y, msg.position.z)
 
-        # --- Filtro di Kalman, nel frame ODOM (fisso), non su bx,by direttamente ---
+        # --- Kalman filter, in the ODOM frame (fixed), not on bx,by directly ---
         odom_tform_body = get_se2_a_tform_b(transforms, ODOM_FRAME_NAME, BODY_FRAME_NAME)
         world_x, world_y = _se2_transform_point(odom_tform_body, bx, by)
 
@@ -228,16 +228,16 @@ class MotionCommandNode(Node):
 
         body_tform_odom = odom_tform_body.inverse()
         bx, by = _se2_transform_point(body_tform_odom, self._kf_x.pos, self._kf_y.pos)
-        # --- fine filtro ---
+        # --- end of filter ---
 
         self._build_and_send_command(bx, by, transforms, source_tag="reale")
 
     def _on_timer(self):
-        """Gira ogni EXTRAPOLATION_TIMER_PERIOD, indipendentemente dai
-        messaggi. Legge lo stato del filtro (senza mai modificarlo) per
-        proiettare in avanti la posizione durante un buco breve."""
+        """Runs every EXTRAPOLATION_TIMER_PERIOD, independently of the
+        messages. Reads the filter state (without ever modifying it) to
+        project the position forward during a short gap."""
         if self._kf_last_update_time is None:
-            return  # nessun dato vero ricevuto ancora
+            return  # no real data received yet
 
         elapsed = time.monotonic() - self._kf_last_update_time
         if elapsed < EXTRAPOLATION_TIMER_PERIOD or elapsed > MAX_EXTRAPOLATION_SEC:
@@ -312,11 +312,11 @@ def main():
         blocking_stand(robot_command_client)
 
         node = MotionCommandNode(robot_state_client, robot_command_client, wrist_tform_camera)
-        # MultiThreadedExecutor, non rclpy.spin(node): _on_target_pose e
-        # _on_timer sono su callback group separati apposta per poter girare
-        # su thread diversi — con l'executor a thread singolo di default,
-        # i due callback group non servirebbero a nulla, resterebbero comunque
-        # in coda uno dietro l'altro.
+        # MultiThreadedExecutor, not rclpy.spin(node): _on_target_pose and
+        # _on_timer are in separate callback groups precisely so they can run
+        # on different threads — with the default single-threaded executor,
+        # the two callback groups would be useless, they would still be
+        # queued one after the other.
         executor = MultiThreadedExecutor(num_threads=2)
         executor.add_node(node)
         try:
