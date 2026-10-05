@@ -47,6 +47,11 @@ import math
 import threading
 import time
 
+import csv
+import datetime
+import json
+import os
+
 import cv2
 import rclpy
 from rclpy.node import Node
@@ -145,6 +150,13 @@ W_MAGNITUDE = 0.8
 EUCLIDEAN_SCALE = 10.0
 MAGNITUDE_SCALE = 10.0
 
+FOV_SEARCH_DEG= 35.0
+FOV_TRACKING_DEG = 60.0
+
+METRICS_DIR ='/home/spot_ws/src/codice_carmine/metriche'
+METRICS_SAVE_PERIOD_SEC = 5.0
+
+
 
 class TrackingFSM(Node):
     def __init__(self, robot=None):
@@ -179,7 +191,8 @@ class TrackingFSM(Node):
 
         # ---------------- Perception ----------------
         self.goal_frame = GOAL_FRAME
-        self.fov_rad = math.radians(CONE_FOV_DEG)
+        self.fov_search_rad = math.radians(FOV_SEARCH_DEG)
+        self.fov_tracking_rad = math.radians(FOV_TRACKING_DEG)
         self.min_range = CONE_MIN_RANGE
         self.max_range = CONE_MAX_RANGE
 
@@ -223,6 +236,19 @@ class TrackingFSM(Node):
         self._reacquisition_count = 0
 
         self._pending_tracker_reset = False  # botsort_hsv ONLY
+        
+        self._metrics_start_wall = time.time()
+        self._metrics_start = time.monotonic()
+        self._metrics_total_frames = 0
+        self._metrics_frames_by_state = {s : 0 for s in (INIT, WAITING_TRIGGER, SEARCH, TRACKING, RECOVERY)}
+        
+        self._metrics_last_save = self._metrics_start
+        self._metrics_final_saved = False
+        
+        os.makedirs(METRICS_DIR, exist_ok=True)
+        stamp = datetime.datetime.fromtimestamp(self._metrics_start_wall).strftime("%Y%m%d_%H%M%S")
+        
+        self._metrics_path = os.path.join(METRICS_DIR, f"tracking_metrics_{stamp}.csv")
 
         self._start_trigger_thread()
 
@@ -246,11 +272,11 @@ class TrackingFSM(Node):
 
         self.get_logger().info(
             f"TrackingFSM avviato — METODO ATTIVO: {TRACKING_METHOD}. Stato iniziale: INIT. "
-            f"ROI: FOV={math.degrees(self.fov_rad):.0f}° (crop larghezza), "
             f"range=[{self.min_range:.2f},{self.max_range:.2f}]m (post-detection, via depth). "
             f"LED: {'ATTIVI' if self.audio_visual_client is not None else 'DISATTIVATI'}")
 
         self._request_led_state(self.state)
+        
 
     # ==================================================================
     # Spot LEDs — dedicated thread, never gRPC calls inside _image_cb
@@ -337,7 +363,68 @@ class TrackingFSM(Node):
             except Exception:
                 pass
 
+
     # ==================================================================
+    # Metrics — frame counts, time, state distribution, FPS, etc. Saved in JSON
+    # ==================================================================
+    def _count_frame(self):
+        """Counts the frame for metrics purposes, and saves the JSON every METRICS_SAVE_PERIOD_SEC seconds."""
+        self._metrics_total_frames += 1
+        self._metrics_frames_by_state[self.state] = self._metrics_frames_by_state.get(self.state, 0) + 1
+        now = time.monotonic()
+        if now - self._metrics_last_save >= METRICS_SAVE_PERIOD_SEC:
+            self.save_metrics(final=False)
+            self._metrics_last_save = now
+
+    def _metrics_snapshot(self, final):
+        duration = time.monotonic() - self._metrics_start
+        by_state = dict(self._metrics_frames_by_state)
+        total = self._metrics_total_frames
+        active = by_state[SEARCH] + by_state[TRACKING] + by_state[RECOVERY]
+        pct = lambda n, d: round(100.0 * n / d, 2) if d else 0.0
+        return {
+            "tracking_method": TRACKING_METHOD,
+            "start_time": datetime.datetime.fromtimestamp(self._metrics_start_wall).isoformat(timespec="seconds"),
+            "end_time": datetime.datetime.now().isoformat(timespec="seconds"),
+            "final": final,
+            "duration_s": round(duration, 2),
+            "total_frames": total,
+            "frames_by_state": by_state,
+            "tracking_frames": by_state[TRACKING],
+            "recovery_frames": by_state[RECOVERY],
+            "active_frames": active,
+            "tracking_pct_of_total": pct(by_state[TRACKING], total),
+            "recovery_pct_of_total": pct(by_state[RECOVERY], total),
+            "tracking_pct_of_active": pct(by_state[TRACKING], active),
+            "recovery_pct_of_active": pct(by_state[RECOVERY], active),
+            "effective_fps": round(total / duration, 2) if duration > 0 else 0.0,
+        }
+
+    def save_metrics(self, final=False):
+        """Saves the metrics snapshot in JSON format. If final=True, also appends a summary row to metrics_summary.csv."""
+        if self._metrics_final_saved:
+            return
+        try:
+            data = self._metrics_snapshot(final)
+            tmp = self._metrics_path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(data, f, indent=2)
+            os.replace(tmp, self._metrics_path)
+            if final:
+                self._metrics_final_saved = True
+                summary = os.path.join(METRICS_DIR, "metrics_summary.csv")
+                row = {k: v for k, v in data.items() if k not in ("frames_by_state", "final")}
+                row.update({f"frames_{s}": n for s, n in data["frames_by_state"].items()})
+                new_file = not os.path.exists(summary)
+                with open(summary, "a", newline="") as f:
+                    w = csv.DictWriter(f, fieldnames=list(row.keys()))
+                    if new_file:
+                        w.writeheader()
+                    w.writerow(row)
+                print(f"[METRICHE] salvate: {self._metrics_path} (+ riga in {summary})")
+        except Exception as ex:
+            print(f"[METRICHE] salvataggio fallito: {ex}")
+    
     def _start_trigger_thread(self):
         """Starts (or restarts) the thread waiting for ENTER. A Python
         thread cannot be restarted once finished — that is why a new one
@@ -406,6 +493,8 @@ class TrackingFSM(Node):
         # ROS stamp (queue delay); time.monotonic() for all internal timings.
         t_wall = time.time()
         t_start = time.monotonic()
+        
+        self._count_frame()
 
         image_stamp = rgb_msg.header.stamp.sec + rgb_msg.header.stamp.nanosec * 1e-9
         queue_delay_ms = (t_wall - image_stamp) * 1000.0
@@ -432,8 +521,9 @@ class TrackingFSM(Node):
         debug_frame = frame_bgr.copy() if publish_debug else None
 
         crop_rect = None
+        fov_raf = self.fov_tracking_rad if self.state in (TRACKING, RECOVERY) else self.fov_search_rad
         if self.intrinsics is not None:
-            crop_rect = compute_roi_crop_rect(w_img, h_img, self.intrinsics, self.fov_rad)
+            crop_rect = compute_roi_crop_rect(w_img, h_img, self.intrinsics, fov_raf)
 
         if debug_frame is not None:
             if crop_rect is not None:
@@ -1151,9 +1241,11 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        node.save_metrics(final=True)
         node.shutdown_leds()
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':

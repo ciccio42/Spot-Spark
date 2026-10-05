@@ -1,0 +1,6 @@
+tracking_method,start_time,end_time,duration_s,total_frames,tracking_frames,recovery_frames,active_frames,tracking_pct_of_total,recovery_pct_of_total,tracking_pct_of_active,recovery_pct_of_active,effective_fps,frames_init,frames_waiting_trigger,frames_search,frames_tracking,frames_recovery
+embedding_only,2026-10-05T14:38:43,2026-10-05T14:38:45,1.38,1,0,0,0,0.0,0.0,0.0,0.0,0.72,1,0,0,0,0
+embedding_only,2026-10-05T14:39:38,2026-10-05T14:39:38,0.23,1,0,0,0,0.0,0.0,0.0,0.0,4.35,1,0,0,0,0
+embedding_only,2026-10-05T14:40:20,2026-10-05T14:46:18,358.43,1038,356,140,554,34.3,13.49,64.26,25.27,2.9,1,483,58,356,140
+embedding_only,2026-10-05T14:46:59,2026-10-05T14:48:09,69.69,174,38,41,89,21.84,23.56,42.7,46.07,2.5,1,84,10,38,41
+embedding_only,2026-10-05T14:50:55,2026-10-05T14:55:08,253.28,812,585,102,732,72.04,12.56,79.92,13.93,3.21,1,79,45,585,102

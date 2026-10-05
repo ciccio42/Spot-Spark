@@ -134,7 +134,7 @@ class Nav2Bridge(Node):
         super().__init__('nav2_bridge')
 
         # --- parameters ---
-        self.declare_parameter('target_distance', 2.5)   # m, body -> person (like the SDK TARGET_DISTANCE)
+        self.declare_parameter('target_distance', 2.0)   # m, body -> person (like the SDK TARGET_DISTANCE)
         self.declare_parameter('enter_margin', 0.40)     # m beyond target_distance to start walking
         self.declare_parameter('exit_margin', 0.15)      # m beyond target_distance to stop
         self.declare_parameter('rot_gain', 1.2)          # rad/s per rad of error

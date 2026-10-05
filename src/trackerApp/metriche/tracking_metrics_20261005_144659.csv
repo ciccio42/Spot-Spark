@@ -1,0 +1,23 @@
+{
+  "tracking_method": "embedding_only",
+  "start_time": "2026-10-05T14:46:59",
+  "end_time": "2026-10-05T14:48:09",
+  "final": true,
+  "duration_s": 69.69,
+  "total_frames": 174,
+  "frames_by_state": {
+    "init": 1,
+    "waiting_trigger": 84,
+    "search": 10,
+    "tracking": 38,
+    "recovery": 41
+  },
+  "tracking_frames": 38,
+  "recovery_frames": 41,
+  "active_frames": 89,
+  "tracking_pct_of_total": 21.84,
+  "recovery_pct_of_total": 23.56,
+  "tracking_pct_of_active": 42.7,
+  "recovery_pct_of_active": 46.07,
+  "effective_fps": 2.5
+}

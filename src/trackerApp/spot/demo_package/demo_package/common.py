@@ -21,7 +21,7 @@ import numpy as np
 # apply both to the crop (compute_roi_crop_rect) and to the post-detection
 # distance check in tracking_fsm.py.
 # ============================================================
-CONE_FOV_DEG = 35.0        # TOTAL ROI aperture, in degrees — crop width (via intrinsics)
+CONE_FOV_DEG = 60.0        # TOTAL ROI aperture, in degrees — crop width (via intrinsics)
 CONE_MIN_RANGE = 1.5       # minimum distance, in metres (POST-detection check, via depth)
 CONE_MAX_RANGE = 3.5       # maximum distance, in metres (POST-detection check, via depth)
 CROP_TOP_MARGIN_FRAC = 0   # fraction of the image height cut from the TOP in the crop
