@@ -3,7 +3,7 @@
 <package format="3">
   <name>detector_package</name>
   <version>0.0.1</version>
-  <description>Nodo di inferenza YOLOE (container yolo): DetectorNode + YoloEInference.</description>
+  <description>YOLOE inference node (yolo container): DetectorNode + YoloEInference.</description>
   <maintainer email="you@example.com">tuo_nome</maintainer>
   <license>Apache-2.0</license>
 

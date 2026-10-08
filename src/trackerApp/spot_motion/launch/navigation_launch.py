@@ -2,22 +2,22 @@
 """
 navigation_launch.py (spot_motion)
 
-Porta su i cinque server Nav2 usati in questo progetto (nessun map_server,
-nessun AMCL — navigazione reattiva su odom, decisione presa mesi fa) piu' il
-lifecycle_manager che li avvia/gestisce, tutti puntati allo stesso file
-parametri: config/nav2_params_spot_real.yaml.
+Brings up the five Nav2 servers used in this project (no map_server,
+no AMCL — reactive navigation on odom, a decision taken months ago) plus the
+lifecycle_manager that starts/manages them, all pointing to the same
+parameters file: config/nav2_params_spot_real.yaml.
 
-ATTENZIONE al nome del nodo lifecycle_manager qui sotto: DEVE combaciare
-esattamente con la chiave top-level 'lifecycle_manager:' dentro il file YAML
-(non 'lifecycle_manager_navigation', la convenzione piu' comune nei tutorial
-nav2_bringup) — ROS2 associa i parametri di un file YAML al nodo per NOME,
-non per posizione; un nome diverso qui farebbe caricare il nodo con i
-parametri di default, ignorando silenziosamente autostart/node_names scritti
-nel YAML, senza nessun errore visibile.
+CAREFUL with the name of the lifecycle_manager node below: it MUST match
+exactly the top-level 'lifecycle_manager:' key inside the YAML file
+(not 'lifecycle_manager_navigation', the most common convention in the
+nav2_bringup tutorials) — ROS 2 matches the parameters of a YAML file to a
+node by NAME, not by position; a different name here would make the node
+load the default parameters, silently ignoring the autostart/node_names
+written in the YAML, without any visible error.
 
-Prerequisito: i nodi di depth_to_pointcloud_launch.py devono essere gia' in
-esecuzione (o lanciati insieme, vedi nota in fondo) — altrimenti i due
-costmap non ricevono mai dati dagli obstacle_layer.
+Prerequisite: the nodes of depth_to_pointcloud_launch.py must already be
+running (or launched together, see note at the bottom) — otherwise the two
+costmaps never receive data from the obstacle_layers.
 """
 import os
 
@@ -30,13 +30,13 @@ def generate_launch_description():
     package_dir = get_package_share_directory('spot_motion')
     params_file = os.path.join(package_dir, 'config', 'nav2_params_spot_real.yaml')
 
-    # $(find-pkg-share ...) dentro il YAML non viene MAI risolto: quella
-    # sintassi la capisce solo il sistema di lancio (file .launch.xml o
-    # Substitution in launch.py), non il caricamento diretto di un file
-    # di parametri via Node(parameters=[...]) — il nodo lo leggerebbe come
-    # stringa letterale (verificato: e' esattamente l'errore avuto).
-    # Calcoliamo il percorso vero qui, in Python, e lo passiamo come
-    # override — sovrascrive silenziosamente il valore-stringa nel YAML.
+    # $(find-pkg-share ...) inside the YAML is NEVER resolved: that syntax
+    # is only understood by the launch system (.launch.xml files or
+    # Substitutions in launch.py), not by loading a parameters file directly
+    # via Node(parameters=[...]) — the node would read it as a literal
+    # string (verified: that is exactly the error we had).
+    # We compute the real path here, in Python, and pass it as an
+    # override — it silently overrides the string value in the YAML.
     bt_xml_path = os.path.join(package_dir, 'bt', 'follow_point_spot.xml')
 
     lifecycle_nodes = [
@@ -83,7 +83,7 @@ def generate_launch_description():
         Node(
             package='nav2_lifecycle_manager',
             executable='lifecycle_manager',
-            name='lifecycle_manager',  # <-- deve combaciare con la chiave nel YAML, vedi nota sopra
+            name='lifecycle_manager',  # <-- must match the key in the YAML, see note above
             output='screen',
             parameters=[params_file],
         ),

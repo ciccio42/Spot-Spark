@@ -1,10 +1,10 @@
-# Pubblicazione fatta da 3d_pose_estimation, calcola la posa 3d del target e lo yaw in relazione al centro del robot e il centro boundig box del target, per fare in modo che il robot possa guardare il target.
+# Published by 3d_pose_estimation: computes the 3D pose of the target and the yaw relative to the robot centre and the centre of the target bounding box, so that the robot can face the target.
 
 std_msgs/Header header
 
 
-#Posizione 3D del target in coordinate 
+# 3D position of the target, in coordinates
 geometry_msgs/Point position
 
-# Orientamento del target in coordinate 
+# Orientation of the target, in coordinates
 float32 yaw

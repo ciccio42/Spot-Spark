@@ -1,20 +1,20 @@
 <!--
-  Segue una posa dinamica aggiornata tramite /goal_update (GoalUpdater) da nav2_bridge.
+  Follows a dynamic pose, updated through /goal_update (GoalUpdater) by nav2_bridge.
 
-  REFRESH PERIODICO del costmap LOCALE (RateController hz="0.5" = ogni 2 s):
-    copre gli ostacoli che se ne vanno FUORI dal campo visivo delle camere
-    frontali (es. una persona che passa di lato): li' nessun raggio puo'
-    pulirli. Gli ostacoli davanti ricompaiono alla nuvola successiva
-    (~0.3-0.5 s). Il refresh continuo DENTRO il campo visivo lo fanno invece
-    le sorgenti clear_frontleft/clear_frontright nel YAML.
-    Regolabile: hz="0.33" (3 s) piu' prudente, hz="1.0" (1 s) piu' aggressivo.
+  PERIODIC REFRESH of the LOCAL costmap (RateController hz="0.5" = every 2 s):
+    covers the obstacles that move OUT of the front cameras' field of view
+    (e.g. a person walking past on the side): no ray can clear them there.
+    Obstacles in front reappear with the next cloud (~0.3-0.5 s). The
+    continuous refresh INSIDE the field of view is done instead by the
+    clear_frontleft/clear_frontright sources in the YAML.
+    Tunable: hz="0.33" (3 s) more conservative, hz="1.0" (1 s) more aggressive.
 
-  RECOVERY: se il ramo principale fallisce (collisione prevista da RPP,
-  progress checker scaduto, percorso non calcolabile): svuota il costmap
-  locale, attende 1 s, riprova. Dopo 10 fallimenti -> ABORTED, e nav2_bridge
-  invia una nuova navigazione al target successivo.
+  RECOVERY: if the main branch fails (collision predicted by RPP, progress
+  checker expired, path cannot be computed): clear the local costmap,
+  wait 1 s, retry. After 10 failures -> ABORTED, and nav2_bridge sends a
+  new navigation to the next target.
 
-  TruncatePath: 0.0 con il nav2_bridge nuovo (goal gia' a target_distance).
+  TruncatePath: 0.0 with the new nav2_bridge (goal already at target_distance).
 -->
 <root main_tree_to_execute="MainTree">
   <BehaviorTree ID="MainTree">

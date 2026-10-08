@@ -2,15 +2,15 @@
 """
 depth_to_pointcloud_launch.py
 
-spot_ros2 pubblica la depth come sensor_msgs/Image (/depth/<camera>/image +
-/depth/<camera>/camera_info) — MAI come PointCloud2. L'obstacle_layer di Nav2
-pero' accetta solo PointCloud2 o LaserScan in input, non un'immagine depth grezza.
+spot_ros2 publishes depth as sensor_msgs/Image (/depth/<camera>/image +
+/depth/<camera>/camera_info) — NEVER as PointCloud2. The Nav2 obstacle_layer,
+however, only accepts PointCloud2 or LaserScan as input, not a raw depth image.
 
-Questo launch file porta su un nodo depth_image_proc::PointCloudXyzNode per
-ciascuna delle TRE camere scelte (frontleft, frontright, hand).
+This launch file brings up one depth_image_proc::PointCloudXyzNode for
+each of the THREE selected cameras (frontleft, frontright, hand).
 
-CORREZIONE CRITICA: Abilitato 'approximate_sync' per evitare il crollo della
-frequenza a 1.5Hz causato dal disallineamento dei timestamp del wrapper dello Spot.
+CRITICAL FIX: 'approximate_sync' is enabled to avoid the rate dropping to
+1.5 Hz because of the timestamp misalignment of the Spot wrapper.
 """
 from launch import LaunchDescription
 from launch_ros.actions import ComposableNodeContainer
@@ -30,11 +30,11 @@ def generate_launch_description():
                 ('camera_info', f'/depth/{camera}/camera_info'),
                 ('points', f'/depth/{camera}/points'),
             ],
-            #approximate_sync sblocca la coda associando frame con timestamp vicini,
-            #portando la pubblicazione da 1.5Hz a oltre 10Hz stabili.
+            # approximate_sync unblocks the queue by pairing frames with close timestamps,
+            # raising the publish rate from 1.5 Hz to a stable 10+ Hz.
             parameters=[{
                 'queue_size': 30,
-                'approximate_sync': True  # <--- MODIFICA FONDAMENTALE PER SPOT
+                'approximate_sync': True  # <--- ESSENTIAL CHANGE FOR SPOT
             }],
         )
         for camera in CAMERAS

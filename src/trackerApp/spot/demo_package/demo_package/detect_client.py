@@ -2,34 +2,33 @@
 """
 detect_client.py
 
-Wrapper leggero attorno a un client ROS2 del servizio
-detector_interfaces/Detect (esposto dal DetectorNode nel container yolo).
+Thin wrapper around a ROS 2 client of the detector_interfaces/Detect
+service (exposed by the DetectorNode in the yolo container).
 
-Versione SINCRONA/BLOCCANTE: call_sync() non ritorna finche' non arriva la
-risposta (o scade il timeout). Significa che durante l'attesa il nodo non
-elabora altri frame — scelta consapevole, accettata sapendo che riduce il
-numero di frame effettivamente processati.
+SYNCHRONOUS/BLOCKING version: call_sync() does not return until the
+response arrives (or the timeout expires). This means that while waiting
+the node does not process other frames — a deliberate choice, accepted
+knowing that it reduces the number of frames actually processed.
 
-COME e' implementata l'attesa bloccante, e perche' NON con
-rclpy.spin_until_future_complete: quella funzione, se non le passi
-esplicitamente l'executor giusto, puo' usarne/crearne uno diverso da quello
-che sta gia' facendo girare il nodo (il nostro MultiThreadedExecutor) — un
-nodo associato a due executor contemporaneamente e' una condizione che
-rclpy non gestisce in modo sicuro, e puo' bloccare tutto silenziosamente
-dopo la prima chiamata riuscita. Usiamo invece un semplice
-`threading.Event`: il MultiThreadedExecutor, che sta gia' girando per
-conto suo, elabora la risposta tramite `future.add_done_callback` (sul
-gruppo dedicato al client, vedi tracking_fsm.py) e sblocca l'evento; il
-thread chiamante aspetta solo quell'evento — nessun secondo spin coinvolto.
+HOW the blocking wait is implemented, and why NOT with
+rclpy.spin_until_future_complete: unless you explicitly pass it the right
+executor, that function may use/create one different from the one already
+spinning the node (our MultiThreadedExecutor) — a node attached to two
+executors at the same time is a condition rclpy does not handle safely,
+and it can silently block everything after the first successful call.
+Instead we use a plain `threading.Event`: the MultiThreadedExecutor, which
+is already spinning on its own, processes the response via
+`future.add_done_callback` (on the group dedicated to the client, see
+tracking_fsm.py) and sets the event; the calling thread only waits for
+that event — no second spin involved.
 
-ATTENZIONE — requisito per evitare un deadlock, non opzionale: questo
-client va costruito con un `callback_group` DIVERSO da quello della
-callback che chiama call_sync() (tipicamente quella dell'immagine), e il
-nodo deve girare su un MultiThreadedExecutor (non il default
-SingleThreadedExecutor di rclpy.spin()). Se client e chiamante fossero
-nello stesso gruppo, la risposta non potrebbe mai essere elaborata mentre
-il thread e' bloccato ad aspettarla. Vedi tracking_fsm.py (main()) per il
-setup completo.
+WARNING — requirement to avoid a deadlock, not optional: this client must
+be built with a `callback_group` DIFFERENT from that of the callback that
+calls call_sync() (typically the image one), and the node must run on a
+MultiThreadedExecutor (not the default SingleThreadedExecutor of
+rclpy.spin()). If client and caller were in the same group, the response
+could never be processed while the thread is blocked waiting for it. See
+tracking_fsm.py (main()) for the complete setup.
 """
 
 import threading
@@ -49,18 +48,17 @@ class DetectClient:
                 f"riprovera' alle prossime chiamate.")
 
     def call_sync(self, image_msg, target_classes=None, timeout_sec=10.0, reset_tracker=False):
-        """Chiamata BLOCCANTE: non ritorna finche' non arriva la risposta (o
-        scade `timeout_sec`).
+        """BLOCKING call: does not return until the response arrives (or
+        `timeout_sec` expires).
 
-        `reset_tracker=True`: chiede al DetectorNode di azzerare lo stato
-        interno del tracker (BoT-SORT) PRIMA di elaborare questa richiesta
-        — usalo quando tracking_fsm torna in SEARCH dopo aver perso il
-        target, cosi' un vecchio track_id non riemerga in una sessione
-        nuova.
+        `reset_tracker=True`: asks the DetectorNode to reset the internal
+        tracker state (BoT-SORT) BEFORE processing this request — use it
+        when tracking_fsm goes back to SEARCH after losing the target, so
+        that an old track_id does not resurface in a new session.
 
-        Ritorna la risposta (detector_interfaces.srv.Detect.Response, campo
-        `detections`), oppure None se: il servizio non e' pronto, la
-        chiamata va in timeout, o fallisce per qualunque altro motivo."""
+        Returns the response (detector_interfaces.srv.Detect.Response,
+        `detections` field), or None if: the service is not ready, the
+        call times out, or it fails for any other reason."""
         if not self.client.service_is_ready():
             return None
 
@@ -76,7 +74,7 @@ class DetectClient:
         def _on_done(future):
             try:
                 result['response'] = future.result()
-            except Exception as ex:  # qualunque errore rclpy/rmw sulla chiamata
+            except Exception as ex:  # any rclpy/rmw error on the call
                 result['error'] = ex
             done_event.set()
 

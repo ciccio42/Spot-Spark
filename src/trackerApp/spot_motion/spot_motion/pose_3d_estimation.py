@@ -1,6 +1,6 @@
-# Nodo che riceve TargetInfoMessage e calcola la posa 3D del target in
-# coordinate camera (posizione a distanza di sicurezza + yaw), pubblicando
-# il risultato su TargetPose3D.
+# Node that receives TargetInfoMessage and computes the 3D pose of the target in
+# camera coordinates (position at a safe distance + yaw), publishing
+# the result as TargetPose3D.
 import time
 
 from demo_interfaces.msg import TargetInfoMessage, TargetPose3D

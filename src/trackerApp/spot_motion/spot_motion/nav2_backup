@@ -2,32 +2,32 @@
 """
 nav2_bridge.py (spot_motion)
 
-Collega la percezione (TargetPose3D, pubblicata da Pose3DEstimationNode) a
+Connects perception (TargetPose3D, published by Pose3DEstimationNode) to
 Nav2:
 
-  1. Trasforma il target nel frame 'odom' (via TF — non piu' SDK bosdyn,
-     spot_driver pubblica gia' tutto l'albero TF che serve).
-  2. Lo smussa con lo STESSO filtro di Kalman gia' scritto per l'approccio
-     SDK diretto (_ConstantVelocityKalman1D) — matematica pura, riusata
-     senza modifiche, lavora gia' in un frame fisso (odom), qui non serve
-     nemmeno il giro di andata/ritorno per il frame body che faceva
-     motion_command_node.py.
-  3. Al PRIMO target confermato: innesca una NavigateToPose. Il behavior
-     tree NON va specificato qui — usa gia' il default (follow_point.xml,
-     impostato in navigation_launch.py).
-  4. Sui successivi: pubblica su /goal_update, che il nodo GoalUpdater
-     dentro l'albero legge per aggiornare il goal SENZA dover rimandare
-     una nuova azione ogni volta (evita di ricominciare la navigazione da
-     capo ad ogni target).
+  1. Transforms the target into the 'odom' frame (via TF — no longer the
+     bosdyn SDK, spot_driver already publishes the whole TF tree needed).
+  2. Smooths it with the SAME Kalman filter already written for the direct
+     SDK approach (_ConstantVelocityKalman1D) — pure maths, reused without
+     changes, it already works in a fixed frame (odom), so here we do not
+     even need the round trip through the body frame that
+     motion_command_node.py did.
+  3. On the FIRST confirmed target: triggers a NavigateToPose. The behavior
+     tree must NOT be specified here — it already uses the default
+     (follow_point.xml, set in navigation_launch.py).
+  4. On the following ones: publishes on /goal_update, which the
+     GoalUpdater node inside the tree reads to update the goal WITHOUT
+     having to send a new action every time (avoids restarting the
+     navigation from scratch at every target).
 
-PERDITA DEL TARGET: a differenza dei comandi SDK diretti (che avevano un
-end_time_secs e scadevano da soli), una NavigateToPose non si ferma da
-sola — bisogna CANCELLARLA esplicitamente. Se non arriva un dato vero da
-piu' di MAX_TARGET_LOSS_SEC, la navigazione in corso viene cancellata.
+TARGET LOSS: unlike the direct SDK commands (which had an end_time_secs and
+expired on their own), a NavigateToPose does not stop by itself — it must
+be CANCELLED explicitly. If no real data arrives for more than
+MAX_TARGET_LOSS_SEC, the ongoing navigation is cancelled.
 
-NESSUN cambiamento a tracking_fsm.py — stessa decisione presa per
-l'approccio precedente: ci si basa solo sul tempo reale trascorso
-dall'ultimo dato vero, non sullo stato SEARCH/TRACKING/RECOVERY.
+NO change to tracking_fsm.py — same decision taken for the previous
+approach: it relies only on the real time elapsed since the last real
+measurement, not on the SEARCH/TRACKING/RECOVERY state.
 """
 import time
 
@@ -44,19 +44,19 @@ from nav2_msgs.action import NavigateToPose
 from demo_interfaces.msg import TargetPose3D
 
 # ============================================================
-GLOBAL_FRAME = 'odom'       # deve combaciare con global_frame in nav2_params_spot_real.yaml
-KF_PROCESS_VAR = 0.05       # stessi valori di motion_command_node.py — stesso significato
+GLOBAL_FRAME = 'odom'       # must match global_frame in nav2_params_spot_real.yaml
+KF_PROCESS_VAR = 0.05       # same values as motion_command_node.py — same meaning
 KF_MEASUREMENT_VAR = 0.05
 KF_RESET_GAP_SEC = 1.0
-MAX_TARGET_LOSS_SEC = 5.0   # oltre questo senza un dato vero, la navigazione in corso
-                              # viene cancellata esplicitamente — regolabile, non ancora
-                              # tarato su test reali
+MAX_TARGET_LOSS_SEC = 5.0   # beyond this without real data, the ongoing navigation
+                              # is cancelled explicitly — tunable, not yet
+                              # calibrated on real tests
 # ============================================================
 
 
 class _ConstantVelocityKalman1D:
-    """Identica a quella in motion_command_node.py — matematica pura,
-    nessuna dipendenza da bosdyn/Nav2, riusata cosi' com'e'."""
+    """Identical to the one in motion_command_node.py — pure maths,
+    no dependency on bosdyn/Nav2, reused as is."""
 
     def __init__(self, process_var, measurement_var):
         self.pos = 0.0
@@ -132,9 +132,9 @@ class Nav2Bridge(Node):
         raw_pose.pose.orientation.w = 1.0
         world_pose = do_transform_pose_stamped(raw_pose, transform)
 
-        # --- Filtro di Kalman, gia' nel frame odom (fisso) — nessun giro
-        # di andata/ritorno per il frame body, a differenza di
-        # motion_command_node.py: qui il goal serve gia' nel frame mondo.
+        # --- Kalman filter, already in the odom frame (fixed) — no round
+        # trip through the body frame, unlike motion_command_node.py:
+        # here the goal is needed in the world frame already.
         now = time.monotonic()
         if self._kf_last_update_time is None or (now - self._kf_last_update_time) > KF_RESET_GAP_SEC:
             self._kf_x.reset(world_pose.pose.position.x)
@@ -146,16 +146,16 @@ class Nav2Bridge(Node):
             self._kf_x.update(world_pose.pose.position.x)
             self._kf_y.update(world_pose.pose.position.y)
         self._kf_last_update_time = now
-        # --- fine filtro ---
+        # --- end of filter ---
 
         goal = PoseStamped()
         goal.header.stamp = self.get_clock().now().to_msg()
         goal.header.frame_id = GLOBAL_FRAME
         goal.pose.position.x = self._kf_x.pos
         goal.pose.position.y = self._kf_y.pos
-        goal.pose.orientation.w = 1.0  # non critico: TruncatePath+RotateToGoal (gia' attivi)
-                                          # gestiscono l'avvicinamento finale, non l'orientamento
-                                          # del goal lontano
+        goal.pose.orientation.w = 1.0  # not critical: TruncatePath+RotateToGoal (already active)
+                                          # handle the final approach, not the orientation
+                                          # of the distant goal
 
         if not self._goal_active:
             self._send_initial_goal(goal)

@@ -14,7 +14,7 @@ setup(
     zip_safe=True,
     maintainer='tuo_nome',
     maintainer_email='you@example.com',
-    description='TrackingFSM (container spot): cono di visione, aggancio automatico, tracking, output Nav2.',
+    description='TrackingFSM (spot container): vision cone, automatic locking, tracking, Nav2 output.',
     license='Apache-2.0',
     tests_require=['pytest'],
     entry_points={

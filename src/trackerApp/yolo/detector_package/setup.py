@@ -14,7 +14,7 @@ setup(
     zip_safe=True,
     maintainer='tuo_nome',
     maintainer_email='you@example.com',
-    description='Nodo di inferenza YOLOE (container yolo): DetectorNode + YoloEInference.',
+    description='YOLOE inference node (yolo container): DetectorNode + YoloEInference.',
     license='Apache-2.0',
     tests_require=['pytest'],
     entry_points={

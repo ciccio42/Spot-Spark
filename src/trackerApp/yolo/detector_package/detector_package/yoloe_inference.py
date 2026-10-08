@@ -2,25 +2,24 @@
 """
 yoloe_inference.py
 
-Wrapper puro (NESSUNA dipendenza ROS) attorno al modello YOLOE. Testabile da
-solo, fuori da un nodo, con un semplice frame numpy.
+Pure wrapper (NO ROS dependency) around the YOLOE model. Testable on its
+own, outside a node, with a plain numpy frame.
 
-Due modalita':
-- detect(frame, classes) — detection singola, indipendente frame per frame
-  (nessuna identita' mantenuta).
-- track(frame, classes) — come detect(), ma usa model.track() di
-  Ultralytics (tracker BoT-SORT di default) con persist=True: mantiene un
-  track_id stabile per lo stesso oggetto tra chiamate CONSECUTIVE, a patto
-  che arrivino in una sequenza temporale reale (stesso flusso video, senza
-  salti) — persist=True tiene in vita lo stato interno del tracker
-  (filtro di Kalman, contatore ID) tra una chiamata e l'altra sulla stessa
-  istanza di YoloEInference.
+Two modes:
+- detect(frame, classes) — single detection, independent frame by frame
+  (no identity kept).
+- track(frame, classes) — like detect(), but uses Ultralytics
+  model.track() (BoT-SORT tracker by default) with persist=True: keeps a
+  stable track_id for the same object across CONSECUTIVE calls, provided
+  they arrive in a real temporal sequence (same video stream, no jumps) —
+  persist=True keeps the internal tracker state (Kalman filter, ID
+  counter) alive between calls on the same YoloEInference instance.
 
-Nessun crop, nessuna ROI, nessun visual-prompt: quelle sono responsabilita'
-di chi chiama (demo_package), non di questa classe.
+No crop, no ROI, no visual prompt: those are the caller's responsibility
+(demo_package), not this class's.
 
-La classe va istanziata UNA VOLTA (carica il modello una sola volta) e
-riusata per tutta la vita del nodo ROS2 che la incapsula.
+The class must be instantiated ONCE (it loads the model only once) and
+reused for the whole life of the ROS 2 node wrapping it.
 """
 
 import dataclasses
@@ -36,30 +35,30 @@ from ultralytics import YOLOE
 
 @dataclasses.dataclass
 class Detection:
-    box: np.ndarray   # [x1, y1, x2, y2] in pixel (float), stesso formato di box.xyxy()
+    box: np.ndarray   # [x1, y1, x2, y2] in pixels (float), same format as box.xyxy()
     score: float
     class_name: str
-    track_id: int = -1  # -1 = non tracciato (da detect(), o track() senza match) — vedi track()
-    embedding: Optional[np.ndarray] = None  # vettore d'aspetto (da un modello di
-                                              # PERSON RE-IDENTIFICATION vero — vedi
-                                              # reid_model_name/reid_model_path) — None se
-                                              # non configurato
+    track_id: int = -1  # -1 = not tracked (from detect(), or track() without a match) — see track()
+    embedding: Optional[np.ndarray] = None  # appearance vector (from a real
+                                              # PERSON RE-IDENTIFICATION model — see
+                                              # reid_model_name/reid_model_path) — None if
+                                              # not configured
 
 
 class YoloEInference:
     def __init__(self, model_path: str, imgsz: int = 640, conf_threshold: float = 0.35,
                  reid_model_name: Optional[str] = None, reid_model_path: Optional[str] = None):
-        """model_path: percorso LOCALE del file .pt. Nessun download a
-        runtime: il modello va salvato nell'immagine Docker del container
-        yolo (o montato come volume), non scaricato ad ogni avvio.
+        """model_path: LOCAL path of the .pt file. No download at run
+        time: the model must be stored in the Docker image of the yolo
+        container (or mounted as a volume), not downloaded at every start.
 
-        reid_model_name/reid_model_path: nome del modello (es. 'osnet_x1_0')
-        e percorso LOCALE dei pesi pre-addestrati (es. su Market1501) per
-        un modello di PERSON RE-IDENTIFICATION vero (libreria torchreid) —
-        indipendente da YOLOE e da BoT-SORT. Serve un file scaricato una
-        volta e tenuto in locale (stesso principio degli altri modelli, mai
-        scaricato a runtime), NON i soli pesi ImageNet generici. Se uno dei
-        due manca, extract_embedding() ritorna sempre None."""
+        reid_model_name/reid_model_path: model name (e.g. 'osnet_x1_0')
+        and LOCAL path of the pre-trained weights (e.g. on Market1501) for
+        a real PERSON RE-IDENTIFICATION model (torchreid library) —
+        independent of YOLOE and BoT-SORT. It needs a file downloaded once
+        and kept locally (same principle as the other models, never
+        downloaded at run time), NOT just the generic ImageNet weights. If
+        either is missing, extract_embedding() always returns None."""
         self.model = YOLOE(model_path)
         self.imgsz = imgsz
         self.conf_threshold = conf_threshold
@@ -93,9 +92,9 @@ class YoloEInference:
         conf_threshold: Optional[float] = None,
         imgsz: Optional[int] = None,
     ) -> List[Detection]:
-        """Detection sull'immagine intera, SENZA identita' tra un frame e
-        l'altro (ogni chiamata e' indipendente). Per il tracciamento con
-        track_id persistente, vedi track()."""
+        """Detection on the whole image, WITHOUT identity between one frame
+        and the next (each call is independent). For tracking with a
+        persistent track_id, see track()."""
         conf = conf_threshold if conf_threshold is not None else self.conf_threshold
         sz = imgsz if imgsz is not None else self.imgsz
         active_classes = self._resolve_classes(classes)
@@ -123,24 +122,22 @@ class YoloEInference:
         tracker: str = "oc_sort.yaml",
         persist: bool = True,
     ) -> List[Detection]:
-        """Come detect(), ma via model.track() — assegna un track_id
-        persistente allo stesso oggetto fisico tra chiamate consecutive.
+        """Like detect(), but via model.track() — assigns a persistent
+        track_id to the same physical object across consecutive calls.
 
-        IMPORTANTE — persist=True presuppone che le chiamate arrivino in
-        sequenza temporale reale sulla STESSA istanza di questa classe
-        (stesso processo, nessun riavvio nel mezzo): lo stato del tracker
-        (filtro di Kalman, contatore ID) vive dentro self.model tra una
-        chiamata e l'altra. Se il chiamante manda frame non consecutivi
-        (es. salta molti frame, o interrompe e riprende dopo molto tempo),
-        il tracker puo' comportarsi in modo inatteso — non e' un bug
-        nostro, e' il comportamento documentato di persist=True.
+        IMPORTANT — persist=True assumes that calls arrive in real temporal
+        sequence on the SAME instance of this class (same process, no
+        restart in between): the tracker state (Kalman filter, ID counter)
+        lives inside self.model between calls. If the caller sends
+        non-consecutive frames (e.g. skips many frames, or stops and
+        resumes after a long time), the tracker may behave unexpectedly —
+        not our bug, it is the documented behaviour of persist=True.
 
-        ReID disattivato di default nel tracker BoT-SORT (with_reid: False
-        nel file botsort.yaml usato internamente da Ultralytics) per
-        minimizzare il costo — l'associazione qui e' basata su moto
-        (Kalman) + IoU, non su un confronto d'aspetto vero. Se serve
-        abilitarlo, va fatto in un file di config del tracker personalizzato,
-        non in questo wrapper."""
+        ReID is disabled by default in the BoT-SORT tracker (with_reid:
+        False in the botsort.yaml used internally by Ultralytics) to
+        minimise cost — association here is based on motion (Kalman) +
+        IoU, not on a real appearance comparison. If you need it, enable it
+        in a custom tracker config file, not in this wrapper."""
         conf = conf_threshold if conf_threshold is not None else self.conf_threshold
         sz = imgsz if imgsz is not None else self.imgsz
         active_classes = self._resolve_classes(classes)
@@ -153,9 +150,9 @@ class YoloEInference:
             class_name = results.names[int(box.cls[0])]
             if active_classes and class_name not in active_classes:
                 continue
-            # box.id e' None se questa specifica detection non e' stata
-            # agganciata a nessun track in questo frame (capita, non e'
-            # un errore) — usiamo -1 come convenzione per "non tracciato".
+            # box.id is None if this specific detection was not attached
+            # to any track in this frame (it happens, it is not an
+            # error) — we use -1 as the convention for "not tracked".
             track_id = int(box.id[0]) if box.id is not None else -1
             detections.append(Detection(
                 box=box.xyxy[0].cpu().numpy(),
@@ -166,17 +163,16 @@ class YoloEInference:
         return detections
 
     def extract_embedding(self, frame_bgr: np.ndarray, box: np.ndarray) -> Optional[np.ndarray]:
-        """Ritaglia il box e ne estrae un vettore d'aspetto tramite un
-        modello di PERSON RE-IDENTIFICATION vero (torchreid/OSNet) — non
-        piu' un modello di classificazione generico: questo e' addestrato
-        specificamente a separare individui diversi, non categorie di
-        oggetti.
+        """Crops the box and extracts an appearance vector from it with a
+        real PERSON RE-IDENTIFICATION model (torchreid/OSNet) — no longer
+        a generic classification model: this one is trained specifically
+        to tell different individuals apart, not object categories.
 
-        Ritorna None se reid_extractor non e' configurato, se il box e'
-        degenere (fuori immagine, area nulla), o se l'estrazione fallisce
-        per qualunque motivo — MAI un vettore "finto" o di fallback: se
-        qualcosa va storto lo si vede nei log, non si propaga un embedding
-        sbagliato che produrrebbe similarita' fuorvianti a valle."""
+        Returns None if reid_extractor is not configured, if the box is
+        degenerate (outside the image, zero area), or if extraction fails
+        for any reason — NEVER a "fake" or fallback vector: if something
+        goes wrong it shows up in the logs, and a wrong embedding that
+        would produce misleading similarities downstream is not propagated."""
         if self.reid_extractor is None:
             return None
         h, w = frame_bgr.shape[:2]
@@ -185,9 +181,9 @@ class YoloEInference:
         x2, y2 = min(w, x2), min(h, y2)
         if x2 <= x1 or y2 <= y1:
             return None
-        # torchreid si aspetta immagini RGB — il nostro frame e' BGR (OpenCV).
-        # Il ridimensionamento a 256x128 e la normalizzazione sono gestiti
-        # INTERNAMENTE da FeatureExtractor, non li facciamo qui.
+        # torchreid expects RGB images — our frame is BGR (OpenCV).
+        # Resizing to 256x128 and normalisation are handled INTERNALLY by
+        # FeatureExtractor, we do not do them here.
         crop_rgb = cv2.cvtColor(frame_bgr[y1:y2, x1:x2], cv2.COLOR_BGR2RGB)
         try:
             features = self.reid_extractor([crop_rgb])
@@ -204,20 +200,19 @@ class YoloEInference:
         return vec
 
     def reset_tracker(self) -> None:
-        """Forza un reset dello stato interno del tracker (Kalman, contatore
-        ID) — pensato per essere chiamato quando tracking_fsm torna in
-        SEARCH dopo aver perso il target, cosi' un vecchio track_id non
-        possa riemergere in modo confuso in una sessione di tracciamento
-        successiva.
+        """Forces a reset of the internal tracker state (Kalman, ID
+        counter) — meant to be called when tracking_fsm goes back to
+        SEARCH after losing the target, so that an old track_id cannot
+        confusingly resurface in a later tracking session.
 
-        NON VERIFICATO A FONDO: Ultralytics non espone un metodo pubblico
-        di reset esplicito e documentato per model.track(); qui sfruttiamo
-        il comportamento documentato di persist=False ("il tracker viene
-        azzerato quando si passa persist=False o cambia la sorgente") con
-        una chiamata a vuoto su un frame minimale. Da testare per davvero
-        prima di fare affidamento su questo in produzione."""
+        NOT THOROUGHLY VERIFIED: Ultralytics does not expose an explicit,
+        documented public reset method for model.track(); here we rely on
+        the documented behaviour of persist=False ("the tracker is reset
+        when persist=False is passed or the source changes") with a dummy
+        call on a minimal frame. Test it for real before relying on this
+        in production."""
         dummy = np.zeros((64, 64, 3), dtype=np.uint8)
         try:
             self.model.track(dummy, conf=0.99, imgsz=64, verbose=False, persist=False)
         except Exception:
-            pass  # il reset e' un "meglio se funziona", non deve far cadere il nodo se fallisce
+            pass  # the reset is best-effort, it must not bring the node down if it fails

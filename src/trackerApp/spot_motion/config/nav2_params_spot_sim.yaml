@@ -1,12 +1,12 @@
 # nav2_params_spot_sim.yaml
 #
-# Parametri Nav2 per Spot in simulazione — navigazione reattiva nel frame odom,
-# senza mappa globale (nessun AMCL, nessun map_server).
-# Odometria: ground truth da Gazebo (/odom/ground_truth).
-# Depth camera frontali collegate solo al costmap locale.
-# robot_base_frame: "base_link" (base champ_base upstream).
+# Nav2 parameters for Spot in simulation — reactive navigation in the odom frame,
+# no global map (no AMCL, no map_server).
+# Odometry: ground truth from Gazebo (/odom/ground_truth).
+# Front depth cameras connected to the local costmap only.
+# robot_base_frame: "base_link" (upstream champ_base).
 #
-# Per abilitare la traslazione laterale cercare i commenti [LATERALE].
+# To enable lateral translation, look for the [LATERALE] comments.
 
 bt_navigator:
   ros__parameters:
@@ -41,25 +41,25 @@ controller_server:
     FollowPath:
       plugin: "nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController"
       desired_linear_vel: 1.0
-      # lookahead piu' lungo per la velocita' piu' alta
+      # longer lookahead for the higher speed
       lookahead_dist: 0.9
       min_lookahead_dist: 0.6
       max_lookahead_dist: 1.2
       use_velocity_scaled_lookahead_dist: false
-      # rallenta nelle zone ad alto costo (vicino agli ostacoli),
-      # dove l'aderenza al percorso e' piu' importante
+      # slow down in high-cost areas (close to obstacles),
+      # where following the path closely matters more
       use_cost_regulated_linear_velocity_scaling: true
       cost_scaling_dist: 0.8
       cost_scaling_gain: 1.0
       transform_tolerance: 0.2
-      # velocita' minima in avvicinamento = velocita' minima efficace
-      # dell'andatura: sotto questo valore il robot cammina sul posto
+      # minimum approach speed = minimum effective speed
+      # of the gait: below this value the robot walks in place
       min_approach_linear_velocity: 0.4
-      # la decelerazione inizia prima, dato che parte da 1.0 m/s
+      # deceleration starts earlier, since it starts from 1.0 m/s
       approach_velocity_scaling_dist: 2.0
       use_regulated_linear_velocity_scaling: true
       regulated_linear_scaling_min_radius: 0.6
-      # anche in curva non si scende sotto la velocita' minima efficace
+      # even in curves, never go below the minimum effective speed
       regulated_linear_scaling_min_speed: 0.4
       use_cost_regulated_linear_velocity_scaling: false
       use_collision_detection: true

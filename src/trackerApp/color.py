@@ -2,18 +2,18 @@
 """
 list_spot_led_behaviors.py
 
-Elenca i behavior A/V (LED + buzzer) GIA' presenti sul robot, con i colori
-di ogni gruppo LED e l'indicazione se contengono una sequenza AUDIO.
-Serve a scegliere quali nomi associare agli stati della FSM in
-tracking_fsm.py (dizionario STATI_LED), dato che il software del robot
-5.0.1 non permette di crearne di nuovi (manca AddOrModifyBehavior).
+Lists the A/V behaviors (LEDs + buzzer) ALREADY present on the robot, with
+the colours of each LED group and whether they contain an AUDIO sequence.
+Use it to choose which names to map to the FSM states in tracking_fsm.py
+(STATI_LED dictionary), since robot software 5.0.1 does not allow creating
+new ones (AddOrModifyBehavior is missing).
 
-Uso (le credenziali si passano come variabili d'ambiente, come suggerisce
-l'SDK stesso):
+Usage (credentials are passed as environment variables, as the SDK itself
+suggests):
     export BOSDYN_CLIENT_USERNAME=admin
     export BOSDYN_CLIENT_PASSWORD=...
-    python3 list_spot_led_behaviors.py            # solo elenco
-    python3 list_spot_led_behaviors.py NOME 5     # prova il behavior NOME per 5 secondi
+    python3 list_spot_led_behaviors.py            # list only
+    python3 list_spot_led_behaviors.py NOME 5     # try behavior NOME for 5 seconds
 """
 
 import os
@@ -28,7 +28,7 @@ LED_GROUPS = ["front_center", "front_left", "front_right", "hind_left", "hind_ri
 
 
 def describe_sequence(led_sequence):
-    """Tipo di animazione + colore di una LedSequence, in una riga."""
+    """Animation type + colour of a LedSequence, on one line."""
     fields = led_sequence.ListFields()
     if not fields:
         return None
@@ -82,7 +82,7 @@ def main():
         print(describe_behavior(live))
         print()
 
-    # Prova opzionale di un behavior: python3 list_spot_led_behaviors.py NOME [secondi]
+    # Optional test of a behavior: python3 list_spot_led_behaviors.py NOME [seconds]
     if len(sys.argv) >= 2:
         name = sys.argv[1]
         seconds = float(sys.argv[2]) if len(sys.argv) >= 3 else 5.0

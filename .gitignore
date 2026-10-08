@@ -12,3 +12,5 @@ src/trackerApp/spot_bags_code/*
 *.ts
 *bag*
 src/trackerApp/spot.zip
+*exp_*
+*metric*

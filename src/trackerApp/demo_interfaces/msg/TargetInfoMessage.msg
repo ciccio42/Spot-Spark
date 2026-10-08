@@ -1,14 +1,14 @@
-# Pubblicato dal nodo di Percezione Solo sui frame in cui il target è confermato. Usato da pose_3d_estimation
+# Published by the Perception node only on frames where the target is confirmed. Used by pose_3d_estimation
 
 std_msgs/Header header
 
-#bounding box del target con convenzione xyxy
+# target bounding box, xyxy convention
 float32[4] bounding_box
 
 
-# Distanza in metri gia calcolata 
+# Distance in metres, already computed
 float32 depth_m
 
-# Nome del topic della camera di immagine e di depth
+# Name of the image and depth camera topics
 string camera_rgb_topic
 string camera_depth_topic
