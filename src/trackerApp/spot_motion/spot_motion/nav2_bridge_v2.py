@@ -42,10 +42,27 @@ BEHAVIOR TREE
   bt_navigator default). With follow_person_spot.xml the distance would be
   added twice. That is why behavior_tree is empty by default.
 
-TARGET LOSS
-  - rotation: stops if the last data is older than rot_timeout
-    (no turning on stale data);
-  - navigation: cancelled after MAX_TARGET_LOSS_SEC, as before.
+TARGET LOSS — BLIND FOLLOWING (single limit: BLIND_FOLLOW_SEC)
+  tracking_fsm publishes ONLY real measurements. When they stop arriving,
+  this node keeps following the PREDICTED position of the person for at most
+  BLIND_FOLLOW_SEC after the last measurement:
+  - the constant-velocity Kalman filter (in odom, fixed in the world) is
+    advanced to the current time by a timer, not only when a message arrives;
+  - NAVIGATE: the goal keeps being updated towards the predicted position
+    (an already active navigation is updated; a NEW one is never started
+    on a prediction alone);
+  - HOLD: the centring keeps rotating towards the predicted position.
+  Beyond BLIND_FOLLOW_SEC: the navigation is cancelled and the rotation
+  stops — a single limit for every kind of motion. The filter is restarted
+  from scratch only after KF_RESET_GAP_SEC without data, so short gaps no
+  longer cancel the velocity estimate.
+
+TF AT THE TIME OF THE SHOT
+  The person position is brought into odom with the TF at msg.header.stamp
+  (the time the frame was captured), not the latest one: with 150-300 ms of
+  perception latency and the robot rotating, the latest TF would place the
+  person a few degrees off. If the TF at that time is not available, the
+  latest one is used (and it is reported once in the log).
 
 DEBUG TOPICS (RViz)
   ~/filtered_target  filtered position of the person (odom)
@@ -71,8 +88,9 @@ from demo_interfaces.msg import TargetPose3D
 GLOBAL_FRAME = 'odom'       # must match global_frame in the Nav2 parameters
 KF_PROCESS_VAR = 0.05
 KF_MEASUREMENT_VAR = 0.05
-KF_RESET_GAP_SEC = 1.0
-MAX_TARGET_LOSS_SEC = 5.0
+KF_RESET_GAP_SEC = 3.0      # without data for longer than this, the filter restarts from the new measurement
+BLIND_FOLLOW_SEC = 2.0      # after the last measurement: follow the PREDICTED position, then stop everything
+BLIND_GOAL_RATE_HZ = 5.0    # rate of the goal updates / loss checks while following blind
 CANCEL_FORCE_SEC = 2.0      # if the cancellation result does not arrive, unblock anyway
 # ============================================================
 
@@ -134,13 +152,13 @@ class Nav2Bridge(Node):
         super().__init__('nav2_bridge')
 
         # --- parameters ---
-        self.declare_parameter('target_distance', 2.5)   # m, body -> person (like the SDK TARGET_DISTANCE)
+        self.declare_parameter('target_distance', 2.4)   # m, body -> person (like the SDK TARGET_DISTANCE)
         self.declare_parameter('enter_margin', 0.40)     # m beyond target_distance to start walking
         self.declare_parameter('exit_margin', 0.15)      # m beyond target_distance to stop
         self.declare_parameter('rot_gain', 1.2)          # rad/s per rad of error
         self.declare_parameter('max_rot_vel', 0.5)       # rad/s (= angular limit of the velocity_smoother)
         self.declare_parameter('rot_deadband_deg', 4.0)  # no rotation below this error
-        self.declare_parameter('rot_timeout', 1.0)       # s: beyond this, no rotation on stale data
+        self.declare_parameter('rot_timeout', BLIND_FOLLOW_SEC)  # s: beyond this, no rotation (predicted data included)
         self.declare_parameter('center_on_camera', True) # centre in the image (ROI) or relative to the body
         self.declare_parameter('base_frame', 'body')
         self.declare_parameter('cmd_vel_topic', 'cmd_vel_nav')
@@ -163,8 +181,11 @@ class Nav2Bridge(Node):
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
         self._kf_x = _ConstantVelocityKalman1D(KF_PROCESS_VAR, KF_MEASUREMENT_VAR)
         self._kf_y = _ConstantVelocityKalman1D(KF_PROCESS_VAR, KF_MEASUREMENT_VAR)
-        self._kf_last_update_time = None
+        self._kf_last_update_time = None   # time.monotonic() of the last REAL measurement
+        self._kf_last_predict_time = None  # time.monotonic() the filter state is propagated to
         self._camera_frame = None
+        self._warned_stamp_tf = False
+        self._blind_announced = False
 
         self.mode = HOLD
         self._goal_active = False
@@ -180,7 +201,7 @@ class Nav2Bridge(Node):
         self._nav_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
 
         self.create_subscription(TargetPose3D, 'target_3d', self._on_target_pose, 5)
-        self.create_timer(1.0, self._check_target_loss)
+        self.create_timer(1.0 / BLIND_GOAL_RATE_HZ, self._blind_follow_loop)
         self.create_timer(0.05, self._rotation_loop)  # 20 Hz
 
         self.get_logger().info(
@@ -188,14 +209,27 @@ class Nav2Bridge(Node):
             f"si ferma sotto {self.D + self.exit_margin:.2f}), centraggio su "
             f"{'camera (ROI)' if self.center_on_camera else self.base_frame}, "
             f"rotazione su '{gp('cmd_vel_topic')}', "
-            f"behavior_tree={self._behavior_tree or '(default del bt_navigator)'}.")
+            f"behavior_tree={self._behavior_tree or '(default del bt_navigator)'}, "
+            f"inseguimento alla cieca max {BLIND_FOLLOW_SEC:.1f} s.")
 
     # ------------------------------------------------------------------
     # Perception -> filtered position of the person in odom
     # ------------------------------------------------------------------
+    def _lookup_at_stamp(self, target, source, stamp_msg):
+        """TF at the time of the shot; falls back to the latest one if not available."""
+        try:
+            return self.tf_buffer.lookup_transform(target, source, rclpy.time.Time.from_msg(stamp_msg))
+        except tf2_ros.TransformException as ex:
+            if not self._warned_stamp_tf:
+                self._warned_stamp_tf = True
+                self.get_logger().warn(
+                    f"TF all'istante dello scatto non disponibile ({ex}) — uso la piu' recente. "
+                    f"Se succede sempre, controlla che robot e container abbiano l'orologio sincronizzato.")
+        return self.tf_buffer.lookup_transform(target, source, rclpy.time.Time())
+
     def _on_target_pose(self, msg: TargetPose3D):
         try:
-            transform = self.tf_buffer.lookup_transform(GLOBAL_FRAME, msg.header.frame_id, rclpy.time.Time())
+            transform = self._lookup_at_stamp(GLOBAL_FRAME, msg.header.frame_id, msg.header.stamp)
         except tf2_ros.TransformException as ex:
             self.get_logger().warn(f"TF non disponibile ({msg.header.frame_id}->{GLOBAL_FRAME}): {ex}",
                                    throttle_duration_sec=2.0)
@@ -213,12 +247,14 @@ class Nav2Bridge(Node):
             self._kf_x.reset(world.pose.position.x)
             self._kf_y.reset(world.pose.position.y)
         else:
-            dt = now - self._kf_last_update_time
-            self._kf_x.predict(dt)
-            self._kf_y.predict(dt)
+            self._advance_filter_to(now)  # the timer may already have propagated part of the gap
             self._kf_x.update(world.pose.position.x)
             self._kf_y.update(world.pose.position.y)
         self._kf_last_update_time = now
+        self._kf_last_predict_time = now
+        if self._blind_announced:
+            self.get_logger().info("Target di nuovo misurato: fine inseguimento alla cieca.")
+            self._blind_announced = False
 
         robot = self._robot_pose()
         if robot is None:
@@ -235,7 +271,9 @@ class Nav2Bridge(Node):
     # ------------------------------------------------------------------
     # Distance policy (with hysteresis)
     # ------------------------------------------------------------------
-    def _decide(self, d, heading, px, py):
+    def _decide(self, d, heading, px, py, predicted=False):
+        """predicted=True: called on the PREDICTED position while blind. An
+        active navigation is updated, a NEW one is never started."""
         if d < 1e-3:
             return
         far = d > self.D + self.enter_margin
@@ -246,7 +284,7 @@ class Nav2Bridge(Node):
         gy = py - self.D * math.sin(heading)
         goal = self._pose(gx, gy, heading)
 
-        if self.mode == HOLD and far:
+        if self.mode == HOLD and far and not predicted:
             self.mode = NAVIGATE
             self.get_logger().info(f"Persona a {d:.2f} m -> NAVIGATE")
         elif self.mode == NAVIGATE and near:
@@ -283,6 +321,7 @@ class Nav2Bridge(Node):
                 self._was_rotating = False
             return
 
+        self._advance_filter_to(time.monotonic())  # centre on the CURRENT (predicted) position
         err = self._centering_error()
         if err is None:
             return
@@ -357,14 +396,49 @@ class Nav2Bridge(Node):
             self._goal_handle.cancel_goal_async()
             self._cancel_requested_at = time.monotonic()
 
-    def _check_target_loss(self):
+    def _advance_filter_to(self, now):
+        """Propagates the filter to 'now' (constant velocity). Idempotent: it only
+        covers the time not yet propagated since the last predict/update."""
+        if self._kf_last_predict_time is None:
+            return
+        dt = now - self._kf_last_predict_time
+        if dt > 0.0:
+            self._kf_x.predict(dt)
+            self._kf_y.predict(dt)
+            self._kf_last_predict_time = now
+
+    def _blind_follow_loop(self):
+        """While no measurement arrives: follows the PREDICTED position for at most
+        BLIND_FOLLOW_SEC, then stops every motion (single limit)."""
         if self._kf_last_update_time is None:
             return
-        elapsed = time.monotonic() - self._kf_last_update_time
-        if elapsed > MAX_TARGET_LOSS_SEC and self._goal_active:
-            self.get_logger().warn(f"Target perso da {elapsed:.1f}s: cancello la navigazione.")
-            self._cancel_navigation()
+        now = time.monotonic()
+        elapsed = now - self._kf_last_update_time
+        if elapsed < 1.5 / BLIND_GOAL_RATE_HZ:
+            return  # measurements are arriving: nothing to predict
+
+        if elapsed > BLIND_FOLLOW_SEC:
+            if self._goal_active and self._cancel_requested_at is None:
+                self.get_logger().warn(f"Target perso da {elapsed:.1f}s: fine inseguimento alla cieca, "
+                                       f"cancello la navigazione.")
+                self._cancel_navigation()
             self.mode = HOLD
+            return
+
+        if not self._blind_announced:
+            self._blind_announced = True
+            self.get_logger().info(f"Target non misurato: inseguo la posizione predetta "
+                                   f"(max {BLIND_FOLLOW_SEC:.1f} s).")
+        self._advance_filter_to(now)
+        robot = self._robot_pose()
+        if robot is None:
+            return
+        rx, ry, _ = robot
+        px, py = self._kf_x.pos, self._kf_y.pos
+        d = math.hypot(px - rx, py - ry)
+        heading = math.atan2(py - ry, px - rx)
+        self.debug_target_pub.publish(self._pose(px, py, heading))
+        self._decide(d, heading, px, py, predicted=True)
 
     # ------------------------------------------------------------------
     # Utility

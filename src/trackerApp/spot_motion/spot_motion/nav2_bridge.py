@@ -44,18 +44,43 @@ BEHAVIOR TREE
 
 TARGET LOSS — BLIND FOLLOWING (single limit: BLIND_FOLLOW_SEC)
   tracking_fsm publishes ONLY real measurements. When they stop arriving,
-  this node keeps following the PREDICTED position of the person for at most
-  BLIND_FOLLOW_SEC after the last measurement:
-  - the constant-velocity Kalman filter (in odom, fixed in the world) is
-    advanced to the current time by a timer, not only when a message arrives;
-  - NAVIGATE: the goal keeps being updated towards the predicted position
-    (an already active navigation is updated; a NEW one is never started
-    on a prediction alone);
-  - HOLD: the centring keeps rotating towards the predicted position.
-  Beyond BLIND_FOLLOW_SEC: the navigation is cancelled and the rotation
-  stops — a single limit for every kind of motion. The filter is restarted
-  from scratch only after KF_RESET_GAP_SEC without data, so short gaps no
-  longer cancel the velocity estimate.
+  this node keeps moving for at most BLIND_FOLLOW_SEC after the last one:
+  - for the first BLIND_PREDICT_SEC it follows the PREDICTED position
+    (constant-velocity Kalman filter in odom): on a straight path it is
+    accurate and it bridges short detection holes;
+  - after that the point is FROZEN: a constant-velocity model cannot know
+    that the person turned a corner, and extrapolating further only moves
+    the goal away from them, straight into the wall. The robot keeps going
+    towards the frozen point, i.e. towards where the person disappeared,
+    stopping BLIND_STANDOFF_M from it (closer than the normal following
+    distance, so that it reaches the corner and can see around it);
+  - NAVIGATE: an already active navigation is updated. A NEW navigation is
+    never started on the moving prediction; towards the FROZEN point it may
+    start (BLIND_START_NAV), also from HOLD: otherwise a robot standing still
+    when the person turned a corner would never get to see around it.
+    HOLD: the centring keeps rotating towards the (predicted, then frozen) point.
+  Beyond BLIND_FOLLOW_SEC: the navigation is cancelled and the final rotation
+  (LOOK, below) starts. When the person is measured again: if the gap was
+  longer than BLIND_PREDICT_SEC the filter restarts CLEANLY from the new
+  measurement (KF_RESET_GAP_SEC), so a wrong prediction never leaves a
+  spurious velocity behind; otherwise it is a normal update.
+
+FINAL ROTATION AFTER BLIND FOLLOWING (LOOK)
+  When blind following ends the robot would stop facing wherever the path
+  left it — after a corner, usually the wall. Instead, for at most
+  LOOK_TIMEOUT_SEC it rotates IN PLACE (never translates) so that the camera
+  looks where the person probably went, and tracking_fsm can re-acquire them.
+  Any new measurement ends it at once (normal behaviour resumes).
+    LOOK_AT = "turn_side" (default): from the last SEEN position, along the
+      direction the person was walking, turned by LOOK_TURN_DEG towards the
+      side they were turning to (sign of the turn rate estimated from the
+      last measurements). If they were not turning (|turn rate| below
+      LOOK_TURN_MIN_DEG_S): straight along their direction of walking.
+      Even when the person disappears right at the start of a turn, the
+      estimated turn rate is small but its SIGN still says left or right.
+    LOOK_AT = "last_seen": towards the last seen position.
+    LOOK_AT = "predicted": towards the predicted (frozen) position.
+    LOOK_AT = None: no final rotation.
 
 TF AT THE TIME OF THE SHOT
   The person position is brought into odom with the TF at msg.header.stamp
@@ -88,10 +113,30 @@ from demo_interfaces.msg import TargetPose3D
 GLOBAL_FRAME = 'odom'       # must match global_frame in the Nav2 parameters
 KF_PROCESS_VAR = 0.05
 KF_MEASUREMENT_VAR = 0.05
-KF_RESET_GAP_SEC = 3.0      # without data for longer than this, the filter restarts from the new measurement
-BLIND_FOLLOW_SEC = 2.0      # after the last measurement: follow the PREDICTED position, then stop everything
+BLIND_PREDICT_SEC = 1.0     # blind: the prediction is used for at most this long, then the point is FROZEN
+BLIND_FOLLOW_SEC = 4.0      # blind: total time moving without measurements, then navigation stops + LOOK
+BLIND_STANDOFF_M = 1.5      # blind, frozen point: stop this far from it (normal following uses target_distance)
+BLIND_MIN_FROM_SEEN_M = 1.0 # blind: the goal is never closer than this to where the person was last SEEN (they
+                            # may have stopped right there while not being detected: the frozen point would then
+                            # be beyond them, and BLIND_STANDOFF_M alone would bring the robot too close)
+BLIND_START_NAV = True      # blind, frozen point: a NEW navigation towards it may start (also from HOLD).
+                            # The frozen point is at most BLIND_PREDICT_SEC beyond a real measurement, i.e.
+                            # "where the person disappeared", not a long extrapolation. Without this, a robot
+                            # that was standing in HOLD when the person turned a corner never moves, and the
+                            # corner keeps hiding them. During the first BLIND_PREDICT_SEC (moving prediction)
+                            # a new navigation is never started. False = previous behaviour.
 BLIND_GOAL_RATE_HZ = 5.0    # rate of the goal updates / loss checks while following blind
+KF_RESET_GAP_SEC = BLIND_PREDICT_SEC  # measured again after a longer gap: the filter restarts from the new
+                                      # measurement (no spurious velocity from a wrong prediction)
 CANCEL_FORCE_SEC = 2.0      # if the cancellation result does not arrive, unblock anyway
+LOOK_AT = "turn_side"       # final rotation: "turn_side", "last_seen", "predicted" or None (off)
+LOOK_TIMEOUT_SEC = 4.0      # at most this long rotating (0.5 rad/s -> ~115 deg)
+LOOK_MIN_DIST = 0.5         # m: closer than this the direction is meaningless -> no final rotation
+LOOK_TURN_DEG = 60.0        # "turn_side": look this far off the walking direction, towards the turn
+LOOK_TURN_MIN_DEG_S = 10.0  # "turn_side": below this turn rate the person is considered walking straight
+LOOK_DIST_M = 2.0           # "turn_side": distance of the look point from the last seen position
+HEADING_MIN_SPEED = 0.3     # m/s: below this the walking direction is not reliable
+HEADING_WINDOW_SEC = 0.8    # turn rate = change of walking direction over this window
 # ============================================================
 
 NAVIGATE = 'NAVIGATE'
@@ -152,7 +197,7 @@ class Nav2Bridge(Node):
         super().__init__('nav2_bridge')
 
         # --- parameters ---
-        self.declare_parameter('target_distance', 2.4)   # m, body -> person (like the SDK TARGET_DISTANCE)
+        self.declare_parameter('target_distance', 2.8)   # m, body -> person (like the SDK TARGET_DISTANCE)
         self.declare_parameter('enter_margin', 0.40)     # m beyond target_distance to start walking
         self.declare_parameter('exit_margin', 0.15)      # m beyond target_distance to stop
         self.declare_parameter('rot_gain', 1.2)          # rad/s per rad of error
@@ -186,6 +231,14 @@ class Nav2Bridge(Node):
         self._camera_frame = None
         self._warned_stamp_tf = False
         self._blind_announced = False
+        self._last_seen = None             # filtered position at the last REAL measurement (odom)
+        self._look_target = None           # point to rotate towards after blind following (odom)
+        self._look_until = None            # time.monotonic() at which the final rotation gives up
+        self._look_started = False         # final rotation already started for this loss
+        self._heading_hist = []            # (time, walking direction) at the last measurements
+        self._walk_heading = None          # walking direction at the last measurement (rad, odom)
+        self._turn_rate = 0.0              # rad/s, estimated from the change of walking direction
+        self._frozen_announced = False
 
         self.mode = HOLD
         self._goal_active = False
@@ -246,12 +299,20 @@ class Nav2Bridge(Node):
         if self._kf_last_update_time is None or (now - self._kf_last_update_time) > KF_RESET_GAP_SEC:
             self._kf_x.reset(world.pose.position.x)
             self._kf_y.reset(world.pose.position.y)
+            self._heading_hist, self._walk_heading, self._turn_rate = [], None, 0.0  # old direction: meaningless
         else:
             self._advance_filter_to(now)  # the timer may already have propagated part of the gap
             self._kf_x.update(world.pose.position.x)
             self._kf_y.update(world.pose.position.y)
         self._kf_last_update_time = now
         self._kf_last_predict_time = now
+        self._last_seen = (self._kf_x.pos, self._kf_y.pos)
+        self._update_heading(now)
+        self._frozen_announced = False
+        if self._look_target is not None:
+            self.get_logger().info("Target di nuovo misurato: fine rotazione finale.")
+        self._look_target = None
+        self._look_started = False
         if self._blind_announced:
             self.get_logger().info("Target di nuovo misurato: fine inseguimento alla cieca.")
             self._blind_announced = False
@@ -271,20 +332,22 @@ class Nav2Bridge(Node):
     # ------------------------------------------------------------------
     # Distance policy (with hysteresis)
     # ------------------------------------------------------------------
-    def _decide(self, d, heading, px, py, predicted=False):
-        """predicted=True: called on the PREDICTED position while blind. An
-        active navigation is updated, a NEW one is never started."""
+    def _decide(self, d, heading, px, py, predicted=False, standoff=None, may_start=False):
+        """predicted=True: called on the PREDICTED / frozen position while blind. An
+        active navigation is updated; a NEW one starts only if may_start (frozen point).
+        standoff: distance to keep from the point (default: target_distance)."""
         if d < 1e-3:
             return
-        far = d > self.D + self.enter_margin
-        near = d < self.D + self.exit_margin
+        D = self.D if standoff is None else standoff
+        far = d > D + self.enter_margin
+        near = d < D + self.exit_margin
 
         # goal at distance D from the person, on the robot->person line, facing them
-        gx = px - self.D * math.cos(heading)
-        gy = py - self.D * math.sin(heading)
+        gx = px - D * math.cos(heading)
+        gy = py - D * math.sin(heading)
         goal = self._pose(gx, gy, heading)
 
-        if self.mode == HOLD and far and not predicted:
+        if self.mode == HOLD and far and (not predicted or may_start):
             self.mode = NAVIGATE
             self.get_logger().info(f"Persona a {d:.2f} m -> NAVIGATE")
         elif self.mode == NAVIGATE and near:
@@ -314,6 +377,11 @@ class Nav2Bridge(Node):
         fresh = (self._kf_last_update_time is not None
                  and time.monotonic() - self._kf_last_update_time < self.rot_timeout)
         can_rotate = self.mode == HOLD and not self._goal_active and fresh
+
+        # Final rotation after blind following: only once the navigation has stopped.
+        if not fresh and self._look_target is not None and not self._goal_active:
+            self._look_step()
+            return
 
         if not can_rotate:
             if self._was_rotating:
@@ -396,11 +464,101 @@ class Nav2Bridge(Node):
             self._goal_handle.cancel_goal_async()
             self._cancel_requested_at = time.monotonic()
 
+    def _start_look(self, now):
+        """Chooses the point to look at when blind following ends (see LOOK_AT)."""
+        if LOOK_AT is None:
+            return
+        if LOOK_AT == "turn_side":
+            target = self._turn_side_point()
+        elif LOOK_AT == "last_seen":
+            target = self._last_seen
+        else:
+            target = (self._kf_x.pos, self._kf_y.pos)
+        robot = self._robot_pose()
+        if target is None or robot is None:
+            return
+        if math.hypot(target[0] - robot[0], target[1] - robot[1]) < LOOK_MIN_DIST:
+            return
+        self._look_target = target
+        self._look_until = now + LOOK_TIMEOUT_SEC
+        what = {"turn_side": f"il lato della svolta (turn rate {math.degrees(self._turn_rate):+.0f} deg/s)",
+                "last_seen": "dove la persona e' stata vista l'ultima volta"}.get(
+                    LOOK_AT, "dove la persona dovrebbe essere secondo la predizione")
+        self.get_logger().info(f"Rotazione finale verso {what}: ({target[0]:.2f}, {target[1]:.2f}), "
+                               f"max {LOOK_TIMEOUT_SEC:.1f} s.")
+
+    def _blind_standoff(self, rx, ry, px, py, d, heading):
+        """Distance to keep from the frozen point: BLIND_STANDOFF_M, increased (goal moved back
+        along the robot->point line) until the goal is at least BLIND_MIN_FROM_SEEN_M from the
+        last SEEN position, never beyond the robot itself."""
+        standoff = BLIND_STANDOFF_M
+        if self._last_seen is None:
+            return standoff
+        lx, ly = self._last_seen
+        while standoff < d:
+            gx, gy = px - standoff * math.cos(heading), py - standoff * math.sin(heading)
+            if math.hypot(gx - lx, gy - ly) >= BLIND_MIN_FROM_SEEN_M:
+                break
+            standoff += 0.05
+        return min(standoff, d)
+
+    def _update_heading(self, now):
+        """Walking direction (from the filtered velocity) and turn rate, at every measurement."""
+        vx, vy = self._kf_x.vel, self._kf_y.vel
+        if math.hypot(vx, vy) < HEADING_MIN_SPEED:
+            return
+        h = math.atan2(vy, vx)
+        self._walk_heading = h
+        self._heading_hist.append((now, h))
+        self._heading_hist = [(t, a) for t, a in self._heading_hist if now - t <= HEADING_WINDOW_SEC]
+        t0, h0 = self._heading_hist[0]
+        if now - t0 > 1e-3:
+            self._turn_rate = math.atan2(math.sin(h - h0), math.cos(h - h0)) / (now - t0)
+
+    def _turn_side_point(self):
+        """Point to look at for LOOK_AT = "turn_side" (see the docstring)."""
+        if self._last_seen is None:
+            return None
+        if self._walk_heading is None:
+            return self._last_seen
+        direction = self._walk_heading
+        if abs(self._turn_rate) >= math.radians(LOOK_TURN_MIN_DEG_S):
+            direction += math.copysign(math.radians(LOOK_TURN_DEG), self._turn_rate)
+        return (self._last_seen[0] + LOOK_DIST_M * math.cos(direction),
+                self._last_seen[1] + LOOK_DIST_M * math.sin(direction))
+
+    def _look_step(self):
+        """One step of the final rotation: rotates the BODY towards the look point
+        (the arm camera may not be aligned with the body, but the body is what Nav2
+        and the next navigation start from). Stops when aligned or at the timeout."""
+        now = time.monotonic()
+        robot = self._robot_pose()
+        if robot is None:
+            return
+        rx, ry, ryaw = robot
+        tx, ty = self._look_target
+        desired = math.atan2(ty - ry, tx - rx)
+        err = math.atan2(math.sin(desired - ryaw), math.cos(desired - ryaw))
+        if abs(err) < self.deadband or now > self._look_until:
+            reason = "allineato" if abs(err) < self.deadband else "tempo scaduto"
+            self.get_logger().info(f"Rotazione finale terminata ({reason}, errore {math.degrees(err):+.1f} deg).")
+            self._look_target = None
+            self.cmd_pub.publish(Twist())
+            self._was_rotating = False
+            return
+        cmd = Twist()
+        cmd.angular.z = _clamp(self.rot_gain * err, -self.max_rot, self.max_rot)
+        self.cmd_pub.publish(cmd)
+        self._was_rotating = True
+
     def _advance_filter_to(self, now):
-        """Propagates the filter to 'now' (constant velocity). Idempotent: it only
-        covers the time not yet propagated since the last predict/update."""
+        """Propagates the filter to 'now' (constant velocity), but never beyond
+        BLIND_PREDICT_SEC after the last measurement: after that the predicted point
+        is FROZEN. Idempotent: it only covers the time not yet propagated."""
         if self._kf_last_predict_time is None:
             return
+        if self._kf_last_update_time is not None:
+            now = min(now, self._kf_last_update_time + BLIND_PREDICT_SEC)
         dt = now - self._kf_last_predict_time
         if dt > 0.0:
             self._kf_x.predict(dt)
@@ -423,13 +581,22 @@ class Nav2Bridge(Node):
                                        f"cancello la navigazione.")
                 self._cancel_navigation()
             self.mode = HOLD
+            if not self._look_started:
+                self._look_started = True
+                self._start_look(now)
             return
 
         if not self._blind_announced:
             self._blind_announced = True
             self.get_logger().info(f"Target non misurato: inseguo la posizione predetta "
                                    f"(max {BLIND_FOLLOW_SEC:.1f} s).")
-        self._advance_filter_to(now)
+        self._advance_filter_to(now)   # stops by itself at BLIND_PREDICT_SEC: then the point is frozen
+        frozen = elapsed > BLIND_PREDICT_SEC
+        if frozen and not self._frozen_announced:
+            self._frozen_announced = True
+            self.get_logger().info(f"Predizione ferma dopo {BLIND_PREDICT_SEC:.1f} s: vado verso il punto "
+                                   f"({self._kf_x.pos:.2f}, {self._kf_y.pos:.2f}) fino a "
+                                   f"{BLIND_STANDOFF_M:.1f} m, per altri {BLIND_FOLLOW_SEC - elapsed:.1f} s.")
         robot = self._robot_pose()
         if robot is None:
             return
@@ -438,7 +605,9 @@ class Nav2Bridge(Node):
         d = math.hypot(px - rx, py - ry)
         heading = math.atan2(py - ry, px - rx)
         self.debug_target_pub.publish(self._pose(px, py, heading))
-        self._decide(d, heading, px, py, predicted=True)
+        standoff = self._blind_standoff(rx, ry, px, py, d, heading) if frozen else None
+        self._decide(d, heading, px, py, predicted=True, standoff=standoff,
+                     may_start=frozen and BLIND_START_NAV)
 
     # ------------------------------------------------------------------
     # Utility

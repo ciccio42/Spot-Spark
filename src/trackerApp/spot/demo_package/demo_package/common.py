@@ -31,6 +31,12 @@ CROP_BOTTOM_MARGIN_FRAC = 0  # fraction of the image height cut from the BOTTOM 
                                   # distance is checked AFTERWARDS on the box depth (box_center_depth),
                                   # not on the crop itself. No TF involved.
 
+# Debug prints called for EVERY detection of EVERY frame: printing to the terminal in the
+# perception loop costs time, and the ReID components are now logged to a CSV by tracking_fsm
+# (REID_LOG_COMPONENTS). True = old behaviour.
+DEBUG_PRINT_DEPTH = False
+DEBUG_PRINT_REID = False
+
 
 # ============================================================
 # 2D/3D geometry
@@ -118,7 +124,8 @@ def box_center_depth(depth_image, box, patch_frac=0.2, min_patch_px=3, min_valid
         crop = crop / 1000.0
 
     valid = crop[(crop > 0.05) & np.isfinite(crop)]
-    print(f"Min valid value: {valid.min() if valid.size > 0 else 'N/A'}, Max valid value: {valid.max() if valid.size > 0 else 'N/A'}, Valid pixel count: {valid.size}")
+    if DEBUG_PRINT_DEPTH:
+        print(f"Min valid value: {valid.min() if valid.size > 0 else 'N/A'}, Max valid value: {valid.max() if valid.size > 0 else 'N/A'}, Valid pixel count: {valid.size}")
     if valid.size < min_valid_pixels:
         return None
     return float(np.median(valid))
@@ -192,26 +199,44 @@ def neural_embedding_similarity(e1, e2):
         return 0.0
     return float(np.dot(e1, e2)/(n1 * n2))
 
-def rich_neural_embedding_similarity(e1, e2, w_cosine=1.0, w_euclidean=1.0 , w_magnitude=1.0, euclidean_scale=10.0 , magnitude_scale=10.0):
-    """Combines cosine similarity and Euclidean distance on the raw vectors (sensitive to magnitude too, not only direction) into a single similarity score. Returns 0.0 if an embedding is missing."""
-    
+def rich_neural_embedding_components(e1, e2, euclidean_scale=10.0, magnitude_scale=10.0):
+    """The three components of rich_neural_embedding_similarity, SEPARATELY:
+        cosine        in [-1, 1]: DIRECTION of the two vectors only (who the person is);
+        euclidean_sim in (0, 1]:  1 / (1 + ||e1 - e2|| / euclidean_scale) — depends on direction
+                                   AND on the norms: ||e1-e2||^2 = n1^2 + n2^2 - 2*n1*n2*cosine;
+        magnitude_sim in (0, 1]:  1 / (1 + |n1 - n2| / magnitude_scale) — NORMS only, no direction.
+    None if an embedding is missing. Used by tracking_fsm to log them (REID_LOG_COMPONENTS)."""
     if e1 is None or e2 is None:
-        return 0.0
-    
+        return None
     n1 = np.linalg.norm(e1)
     n2 = np.linalg.norm(e2)
-    
     cosine = float(np.dot(e1, e2) / (n1 * n2)) if n1 > 1e-8 and n2 > 1e-8 else 0.0
-    euclidean_dist = np.linalg.norm(e1 - e2)
-    euclidean_sim = 1.0 / (1.0 + euclidean_dist / euclidean_scale)  # Normalise the Euclidean distance into a similarity score between 0 and 1
-    magnitude_diff = abs(n1 - n2)
-    magnitude_sim = 1.0 / (1.0 + magnitude_diff / magnitude_scale)  # Normalise the magnitude difference into a similarity score
+    euclidean_sim = 1.0 / (1.0 + float(np.linalg.norm(e1 - e2)) / euclidean_scale)
+    magnitude_sim = 1.0 / (1.0 + abs(float(n1 - n2)) / magnitude_scale)
+    return cosine, euclidean_sim, magnitude_sim
+
+
+def combine_reid_components(components, w_cosine=1.0, w_euclidean=1.0, w_magnitude=1.0):
+    """Weighted mean of the three components (see rich_neural_embedding_components).
+    0.0 if components is None (missing embedding)."""
+    if components is None:
+        return 0.0
+    cosine, euclidean_sim, magnitude_sim = components
     total_weight = w_cosine + w_euclidean + w_magnitude
-    
-    print(f"Cosine: {cosine:.4f}, Euclidean Sim: {euclidean_sim:.4f}, Magnitude Sim: {magnitude_sim:.4f}, Total Weight: {total_weight:.4f}")
-    
-    
-    return (w_cosine * cosine + w_euclidean * euclidean_sim + w_magnitude * magnitude_sim) / total_weight 
+    return (w_cosine * cosine + w_euclidean * euclidean_sim + w_magnitude * magnitude_sim) / total_weight
+
+
+def rich_neural_embedding_similarity(e1, e2, w_cosine=1.0, w_euclidean=1.0 , w_magnitude=1.0, euclidean_scale=10.0 , magnitude_scale=10.0):
+    """Combines cosine similarity and Euclidean distance on the raw vectors (sensitive to magnitude too, not only direction) into a single similarity score. Returns 0.0 if an embedding is missing.
+    Same result as before: weighted mean of rich_neural_embedding_components."""
+    components = rich_neural_embedding_components(e1, e2, euclidean_scale, magnitude_scale)
+    if components is None:
+        return 0.0
+    if DEBUG_PRINT_REID:
+        cosine, euclidean_sim, magnitude_sim = components
+        print(f"Cosine: {cosine:.4f}, Euclidean Sim: {euclidean_sim:.4f}, Magnitude Sim: {magnitude_sim:.4f}, "
+              f"Total Weight: {w_cosine + w_euclidean + w_magnitude:.4f}")
+    return combine_reid_components(components, w_cosine, w_euclidean, w_magnitude)
 
 
 # ============================================================
