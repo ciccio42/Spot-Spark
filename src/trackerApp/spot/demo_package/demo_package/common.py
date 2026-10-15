@@ -32,9 +32,14 @@ CROP_BOTTOM_MARGIN_FRAC = 0  # fraction of the image height cut from the BOTTOM 
                                   # not on the crop itself. No TF involved.
 
 # Debug prints called for EVERY detection of EVERY frame: printing to the terminal in the
-# perception loop costs time, and the ReID components are now logged to a CSV by tracking_fsm
-# (REID_LOG_COMPONENTS). True = old behaviour.
+# perception loop costs time. True = old behaviour.
 DEBUG_PRINT_DEPTH = False
+
+# Depth of a detected person (box_center_depth): torso band of the box + low percentile
+DEPTH_BAND_X = (0.15, 0.85)      # fraction of the box width
+DEPTH_BAND_Y = (0.10, 0.50)      # fraction of the box height, from the top (head/shoulders/chest)
+DEPTH_PERCENTILE = 20            # low percentile: the person is the nearest surface in the band
+DEPTH_MIN_VALID_PIXELS = 20
 DEBUG_PRINT_REID = False
 
 
@@ -91,31 +96,26 @@ class CameraIntrinsics:
 # Depth
 # ============================================================
 
-def box_center_depth(depth_image, box, patch_frac=0.2, min_patch_px=3, min_valid_pixels=3):
-    """Depth (median, in metres) over a SMALL patch centred on the box —
-    not the whole box, not a single pixel.
+def box_center_depth(depth_image, box, min_valid_pixels=DEPTH_MIN_VALID_PIXELS, **_legacy):
+    """Distance (m) of the person in `box` (depth-image coordinates), None if not measurable.
 
-    Why not the whole box: if the box is not tight around the subject
-    (common with YOLOE), the background pixels at the edges contaminate the
-    median, pulling the computed distance towards the background.
-
-    Why not a single pixel: depth sensors often have holes at isolated
-    points (noise, reflections) — one unlucky pixel would give None even
-    with the subject perfectly visible there.
-
-    `patch_frac`: fraction of the box width/height to sample, centred.
-    With patch_frac=0.2 on a 100x200px box, the patch is 20x40px."""
+    Read on the TORSO band of the box (DEPTH_BAND_X x DEPTH_BAND_Y, fractions of the box), taking a
+    LOW percentile (DEPTH_PERCENTILE) of the valid pixels — not the median of the centre:
+      - side view / sitting: the centre of the box falls in the gap between torso, arms and legs
+        and the sensor sees the background (2.0 m -> 4.5 m in the 13/10 video); in the torso band
+        the person is the NEAREST surface, so a low percentile lands on the person even when part
+        of the band is background;
+      - a box not tight around the subject: same reasoning, the edges are background (farther).
+    Something IN FRONT of the person (an occluder) is nearer and would win: tracking_embedding
+    recognises that case (depth much closer, box not bigger) and discards the depth.
+    Extra keyword arguments of the old version (patch_frac, min_patch_px) are accepted and ignored."""
     h, w = depth_image.shape[:2]
     x1, y1, x2, y2 = box
-    cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
-    box_w, box_h = (x2 - x1), (y2 - y1)
-    patch_w = max(box_w * patch_frac, min_patch_px)
-    patch_h = max(box_h * patch_frac, min_patch_px)
-
-    px1 = max(0, int(cx - patch_w / 2))
-    px2 = min(w, int(cx + patch_w / 2))
-    py1 = max(0, int(cy - patch_h / 2))
-    py2 = min(h, int(cy + patch_h / 2))
+    bw, bh = x2 - x1, y2 - y1
+    px1 = max(0, int(x1 + DEPTH_BAND_X[0] * bw))
+    px2 = min(w, int(math.ceil(x1 + DEPTH_BAND_X[1] * bw)))
+    py1 = max(0, int(y1 + DEPTH_BAND_Y[0] * bh))
+    py2 = min(h, int(math.ceil(y1 + DEPTH_BAND_Y[1] * bh)))
     if px2 <= px1 or py2 <= py1:
         return None
 
@@ -125,10 +125,11 @@ def box_center_depth(depth_image, box, patch_frac=0.2, min_patch_px=3, min_valid
 
     valid = crop[(crop > 0.05) & np.isfinite(crop)]
     if DEBUG_PRINT_DEPTH:
-        print(f"Min valid value: {valid.min() if valid.size > 0 else 'N/A'}, Max valid value: {valid.max() if valid.size > 0 else 'N/A'}, Valid pixel count: {valid.size}")
+        print(f"Depth band: {valid.size} valid px, min {valid.min() if valid.size else 'N/A'}, "
+              f"p{DEPTH_PERCENTILE} {np.percentile(valid, DEPTH_PERCENTILE) if valid.size else 'N/A'}")
     if valid.size < min_valid_pixels:
         return None
-    return float(np.median(valid))
+    return float(np.percentile(valid, DEPTH_PERCENTILE))
 
 
 def scale_box_to_depth(box, rgb_shape, depth_shape):
@@ -205,7 +206,7 @@ def rich_neural_embedding_components(e1, e2, euclidean_scale=10.0, magnitude_sca
         euclidean_sim in (0, 1]:  1 / (1 + ||e1 - e2|| / euclidean_scale) — depends on direction
                                    AND on the norms: ||e1-e2||^2 = n1^2 + n2^2 - 2*n1*n2*cosine;
         magnitude_sim in (0, 1]:  1 / (1 + |n1 - n2| / magnitude_scale) — NORMS only, no direction.
-    None if an embedding is missing. Used by tracking_fsm to log them (REID_LOG_COMPONENTS)."""
+    None if an embedding is missing."""
     if e1 is None or e2 is None:
         return None
     n1 = np.linalg.norm(e1)

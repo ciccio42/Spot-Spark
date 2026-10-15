@@ -45,3 +45,122 @@ colcon build --symlink-install --packages-ignore champ_gazebo
 ros2 topic pub --once /arm_controller/joint_trajectory trajectory_msgs/msg/JointTrajectory \
 "{joint_names: [arm_sh0, arm_sh1, arm_el0, arm_el1, arm_wr0, arm_wr1, arm_f1x],
   points: [{positions: [0.0, -3.1, 3.1, 0.0, 0.0, 0.0, 0.0], time_from_start: {sec: 3}}]}"
+
+
+
+  W_COSINE = 0.3                   # ReID similarity = weighted mean of cosine, Euclidean and magnitude terms
+W_EUCLIDEAN = 0.7
+W_MAGNITUDE = 0.0
+EUCLIDEAN_SCALE = 10.0
+MAGNITUDE_SCALE = 10.0
+
+MIN_DETECTION_CONFIDENCE = 0.10  # YOLOE confidence
+TRACK_MIN_RANGE = 0.3            # usable depth (m); outside it the depth is treated as missing
+TRACK_MAX_RANGE = 6.0
+PERSON_MAX_HEIGHT_M = 2.1        # depth implying a taller person (box height px x depth / fy) is not the
+                                 # person's (background through a gap) -> treated as missing
+DEDUPE_IOU = 0.6                 # same subject under two prompts
+
+STABILITY_FRAMES_REQUIRED = 10   # SEARCH: frames of one stable person before the lock
+SEARCH_STABILITY_MIN_COS = 0.60  # SEARCH: plain cosine between consecutive frames (independent of the weights)
+
+# PROVISIONAL values from the 13/10 video (your weights): you, frame to frame 0.71-0.79; you, same
+# pose seconds later vs the gallery 0.52-0.60; side 0.47-0.69; back / behind the jacket 0.39-0.50;
+# Pepper (not a person) 0.31-0.36; ANOTHER PERSON: not measured yet -> recalibrate with
+# "sim_stats" of the metrics JSON of a session with a second person.
+TARGET_HIGH = 0.60               # target CONFIRMED
+TARGET_LOW = 0.45                # target KEPT (uncertain) between LOW and HIGH
+GALLERY_VETO_MIN = 0.43          # never the target below this similarity to the gallery (None = off)
+FF_MAX_LEAD = 0.15               # sim_target = max(gallery, min(last embedding, gallery + this)): the short-term
+                                 # memory can lift a detection only this much above the long-term one. If an
+                                 # impostor was followed for a while, the last embedding IS the impostor: without
+                                 # this cap it would always beat the real target (seen on the robot, 13/10)
+HOLD_MAX_MISSES = 5              # calls without the target before the re-acquisition rules apply
+SHORT_GAP_FROZEN_GATE = True     # short gap: the gate keeps the size it had at the last sighting (the
+                                 # centre still follows the prediction). Off: it widens at every miss
+                                 # (~160 px / 1.2 m after 1 miss, ~360 px / 2 m after 3) and a person
+                                 # never seen before, standing where the target vanished, gets in.
+OTHER_CONTINUITY_MAX = 1.0       # a detection CONTINUES a person of the previous call if it is closer to that person's
+                                 # box than to the target's (cost = |du| / box width + 2 |ln(height ratio)|, at most
+                                 # this) and not clearly more similar to the target: while it walks over the target
+                                 # its crop is mixed (part of the target inside) and the appearance alone is fooled
+GALLERY_TIEBREAK = 0.06         # tie on sim_target: the one clearly more similar to the GALLERY wins, then the position
+AMBIGUITY_MARGIN = 0.05          # appearance decides; two candidates closer than this in sim_target are a tie:
+                                 # the one near the Kalman prediction wins, otherwise nobody is taken
+CLEAN_MARGIN = 0.5               # clean frame: no other box touches the target box widened by this (x width)
+
+# (A) NO POSITION BONUS WHEN SOMEBODY ELSE IS THERE. Near the Kalman prediction the threshold is
+# TARGET_LOW instead of REACQ_THRESHOLD and the position breaks ties: the position is a second proof
+# only if nobody else could be at the predicted point. If in the previous call another person touched
+# the target's box at the prediction (widened by CLEAN_MARGIN: beside it, covering it), whoever is
+# found there now may be that person (photos IMG_0347/0348, 14/10: the occluder taken as KEPT at
+# 0.46) -> everybody needs REACQ_THRESHOLD and a tie is "ambiguous". Nobody around (turning around,
+# a detector flicker): the bonus stays.
+NEAR_BONUS_ONLY_WHEN_ALONE = True
+# (B) STICKY INTRUDERS. A person of the previous call who continues there (box closer to theirs than
+# to the target's by INTRUDER_STICKY_MARGIN, see _box_cost) STAYS an intruder: never a candidate, and
+# kept in the people list even when its similarity gets close to the target's (it happens while it
+# covers the target: mixed crop, and the target's own similarity drops). Released only if the GALLERY
+# recognises it clearly (sim_gal >= INTRUDER_RELEASE_SIM): the way out if the target itself was
+# labelled an intruder by mistake.
+INTRUDER_STICKY = True
+INTRUDER_STICKY_MARGIN = 0.2
+INTRUDER_RELEASE_SIM = 0.62
+
+# DEPTH NOT BELONGING TO THE TARGET. The depth is read in the centre of the box: on a partial
+# occlusion it falls on the OCCLUDER (closer), through a gap between arms and body on the BACKGROUND
+# (farther) -> 3D gate fails although the target is right there. Rule: depth far from the prediction
+# while the box SIZE agrees with the predicted depth (a person really closer would have a bigger box,
+# really farther a smaller one) -> the depth is discarded: gate in 2D, Kalman updated without depth,
+# nothing learnt, not published to Nav2 ("TARGET OCCLUSO" / "DEPTH SCARTATA" in the debug image).
+OCCLUSION_DEPTH_FALLBACK = True
+OCCLUSION_DEPTH_JUMP_M = 0.5     # |measured - predicted depth| above this
+OCCLUSION_MAX_SIZE_RATIO = 1.15  # box height vs expected height at the predicted depth (tolerance)
+# ... but if the Kalman depth itself is the wrong one (it happened in the 13/10 video: 4.5 m read on
+# the background was accepted, then the true 2.0 m was always discarded as "occluded"), discarding
+# forever never heals it. RE-SYNC: DEPTH_RESYNC_FRAMES consecutive discarded depths that agree with
+# each other (spread <= DEPTH_RESYNC_MAX_SPREAD_M) with NO detection overlapping the target (nothing
+# visible in front) -> the Kalman depth is reset to the measured one.
+DEPTH_RESYNC_FRAMES = 3
+DEPTH_RESYNC_MAX_SPREAD_M = 0.3
+
+REACQ_THRESHOLD = 0.50           # re-acquisition (was 0.60: you, frontal in RECOVERY, stayed at 0.52-0.58)
+REACQ_IMMEDIATE_SIM = 0.58       # between REACQ_THRESHOLD and this: REACQ_CONFIRM_FRAMES calls in the same place
+REACQ_CONFIRM_FRAMES = 2
+REACQ_PX_TOLERANCE = 60.0
+REACQ_MAX_GAP = 2
+REACQ_REQUIRE_DEPTH = True
+# Far from the prediction / after a loss the appearance alone is not enough (seen on the robot,
+# 13/10: a robot much farther away taken as the target). Also required:
+REACQ_MAX_RANGE_M = 4.0          # not farther than this (None = off): wait until it comes closer
+REACQ_DEPTH_TOL_M = 1.0          # |depth - last target depth| <= this + REACQ_DEPTH_SPEED_MPS x seconds
+REACQ_DEPTH_SPEED_MPS = 0.8      #   since it was last seen (a walking person moves ~1 m/s)
+# CLASS: the target keeps the class group it had at the lock. A detection can be the target only if
+# YOLOE scores it at least as much for a class of that group as for any other class (a box merged
+# from 'person' 0.4 + 'humanoid robot' 0.6 is a robot, not a person).
+CLASS_GROUPS = (("person",),
+                ("quadruped", "quadruped animal", "quadruped robot", "robotic dog", "four-legged robot", "dog"),
+                ("robot", "humanoid robot"))
+
+TRACKING_GRACE_FRAMES = 30       # TRACKING -> RECOVERY after this many calls without the target
+RECOVERY_TIMEOUT_SEC = 15.0      # RECOVERY -> WAITING_TRIGGER
+
+KF_ACCEL_PX = 40000.0            # Kalman: white-noise acceleration, image (px^2/s^3) and depth (m^2/s^3)
+KF_ACCEL_DEPTH = 1.0
+KF_MEAS_STD_PX = 10.0            # measurement noise: box centre (px), ToF depth (m)
+KF_MEAS_STD_DEPTH = 0.15
+KF_INIT_VEL_STD_PX = 300.0
+KF_INIT_VEL_STD_DEPTH = 1.5
+GATE_CHI2_3D = 11.34             # gate: chi-square 99%, (u, v, d) / (u, v) without depth
+GATE_CHI2_2D = 9.21
+PREDICTION_MAX_SEC = 2.0         # the target prediction is drawn only this long after the last measurement
+
+REID_GALLERY_SIZE = 8            # GALLERY: view 0 = SEARCH lock, never removed
+GALLERY_NOVELTY_SIM = 0.80       # a view is added only if less similar than this to every stored view
+GALLERY_STRONG_ADD_MIN_SIM = 0.70  # clean frame this similar to the gallery: add (if new) and anchor the chain
+GALLERY_CHAIN_FRAMES = 4         # ... or N clean continuous frames after an anchor
+GALLERY_CHAIN_MIN_IOU = 0.5
+GALLERY_CHAIN_MAX_DEPTH_STEP_M = 0.3
+
+KF_TRAIL_LEN = 15                # target Kalman positions drawn as a trail in the debug image
+KF_FUTURE_SEC = 1.0              # debug image: where the Kalman expects the target in this many seconds
