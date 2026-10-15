@@ -1,0 +1,79 @@
+fsm_node:
+  ros__parameters:
+    # FSM timer frequency (Hz): every tick runs the handler of the current state
+    rate: 10.0
+
+    # ---------- dependencies ----------
+    # YOLO detection service (yolo_detector/detector_node)
+    detection_service: "detection"
+    # Nav2 action (spot_motion/navigation_launch.py)
+    navigate_action: "navigate_to_pose"
+    # Manipulate action
+    manipulate_action: "manipulation_custom"
+    # MoveArmToPose action
+    move_arm_action: "move_arm_to_pose"
+    # OpenGripper service
+    open_gripper_service: "open_gripper"
+    # CloseGripper service
+    close_gripper_service: "close_gripper"
+    # Nav2 BT for the goal; empty = Nav2 default BT (navigate_to_pose_w_replanning_and_recovery.xml),
+    # which ends with SUCCESS on arrival. Do NOT use spot_motion/bt/follow_point_spot.xml: it never ends.
+    behavior_tree: ""
+
+    # ---------- frames ----------
+    # must match global_frame / robot_base_frame in spot_motion/config/nav2_params_spot_real.yaml
+    global_frame: "odom"
+    base_frame: "body"
+
+    # ---------- 3D localization of the ball ----------
+    # intrinsics of the camera the detection runs on
+    camera_info_topic: "/camera/hand/camera_info"
+    # depth registered to the hand color camera (same pixels as the detection)
+    depth_topic: "/depth_registered/hand/image"
+
+    # ---------- navigation ----------
+    # distance (m) between robot body and ball at the end of the navigation
+    standoff_distance: 0.8
+    # if the robot is already within standoff_distance + min_nav_distance (m) it does not navigate
+    # (Nav2 xy_goal_tolerance is 0.30)
+    min_nav_distance: 0.3
+
+    # ---------- timeouts (s) ----------
+    detection_timeout: 15.0
+    navigation_timeout: 60.0
+
+    # read Enter from the terminal to start (works with ros2 run and ros2 launch);
+    # the /fsm_node/start service always works too
+    use_stdin: true
+
+    # --------- Detection Poses ----------
+    far_detection_pose:
+      position:
+        x: 0.602
+        y: 0.010
+        z: 0.225
+      orientation:
+        x: -0.021
+        y: 0.194
+        z: 0.020
+        w: 0.981
+
+    near_detection_pose:
+      position:
+        x: 0.498
+        y: -0.004
+        z: 0.236
+      orientation:
+        x: 0.006
+        y: 0.478
+        z: -0.018
+        w: 0.878
+
+    # --------- shutdown ----------
+    # Trigger service called on Ctrl+C / SIGTERM from any state to reset the arm (spot_driver)
+    arm_reset_service: "arm_stow"
+    # Trigger service called before every navigation to stow the arm, and its timeout (s)
+    arm_stow_service: "arm_stow"
+    arm_stow_timeout: 10.0
+    # max time (s) to wait for the arm reset; keep it below sigterm_timeout in fsm_launch.py
+    shutdown_timeout: 7.0

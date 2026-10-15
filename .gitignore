@@ -14,3 +14,25 @@ src/trackerApp/spot_bags_code/*
 src/trackerApp/spot.zip
 *exp_*
 *metric*
+src/autonomous_manipulation_app/yolo_detector/yolo_checkpoint
+# colcon / ROS 2 build output, in the repo root or in any sub-folder (e.g. a build run inside src/)
+build/
+install/
+log/
+COLCON_IGNORE
+
+# Python build/cache files
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.pytest_cache/
+
+# CMake / C++ build files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+
+# runtime output of yolo_detector (images saved by detector_node)
+src/autonomous_manipulation_app/yolo_detector/tmp/

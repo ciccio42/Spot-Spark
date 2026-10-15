@@ -1,0 +1,23 @@
+# Trigger-like service: empty request, returns the best tennis ball
+# detection (highest confidence) found in the last processed frame.
+# If the last frame contains no tennis ball, success is false and all
+# numeric fields are set to -1.
+---
+bool success
+string message
+string class_name
+# frame_id of the camera image the detection comes from (empty if no frame processed yet)
+string frame_id
+# timestamp of that camera image (zero if no frame processed yet)
+builtin_interfaces/Time stamp
+float32 confidence
+# true if the coordinates below are normalized in [0, 1], false if they are in pixels
+bool normalized
+# bounding box corners
+float32 x1
+float32 y1
+float32 x2
+float32 y2
+# bounding box center
+float32 center_x
+float32 center_y

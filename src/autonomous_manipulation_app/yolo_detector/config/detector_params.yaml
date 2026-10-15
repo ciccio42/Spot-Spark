@@ -1,0 +1,10 @@
+detection_node:
+  ros__parameters:
+    checkpoint: "tennis_ball.pt"   # file in <share>/yolo_detector/yolo_checkpoint
+    model_path: ""                 # full path; if set, overrides checkpoint
+    camera_name: "/camera/hand/compressed"
+    device: "cuda:0"               # "cuda:0", "cuda:1", ... or "cpu"
+    output_dir: "/home/yolo_ws/src/autonomous_manipulation_app/yolo_detector/tmp"   # bind-mounted from host
+    conf_threshold: 0.5            # minimum detection confidence
+    target_class: "tennis_ball"    # class returned by the detection service
+    normalized: false              # true: bbox/center in [0, 1], false: pixels

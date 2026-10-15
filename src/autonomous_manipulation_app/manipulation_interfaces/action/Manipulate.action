@@ -1,0 +1,9 @@
+string frame_id
+float32 x_center
+float32 y_center
+builtin_interfaces/Time timestamp
+---
+bool success
+string message
+---
+bosdyn_api_msgs/ManipulationApiFeedbackResponse feedback

@@ -1,0 +1,46 @@
+<!--
+  Follows a dynamic pose, updated through /goal_update (GoalUpdater) by nav2_bridge.
+
+  PERIODIC REFRESH of the LOCAL costmap (RateController hz="0.5" = every 2 s):
+    covers the obstacles that move OUT of the front cameras' field of view
+    (e.g. a person walking past on the side): no ray can clear them there.
+    Obstacles in front reappear with the next cloud (~0.3-0.5 s). The
+    continuous refresh INSIDE the field of view is done instead by the
+    clear_frontleft/clear_frontright sources in the YAML.
+    Tunable: hz="0.33" (3 s) more conservative, hz="1.0" (1 s) more aggressive.
+
+  RECOVERY: if the main branch fails (collision predicted by RPP, progress
+  checker expired, path cannot be computed): clear the local costmap,
+  wait 1 s, retry. After 10 failures -> ABORTED, and nav2_bridge sends a
+  new navigation to the next target.
+
+  TruncatePath: 0.0 with the new nav2_bridge (goal already at target_distance).
+-->
+<root main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <RecoveryNode number_of_retries="10" name="FollowWithRecovery">
+      <PipelineSequence name="FollowWithReplanning">
+        <RateController hz="0.5">
+          <ClearEntireCostmap name="PeriodicClearLocal"
+            service_name="local_costmap/clear_entirely_local_costmap" />
+        </RateController>
+        <RateController hz="3.0">
+          <Sequence>
+            <GoalUpdater input_goal="{goal}" output_goal="{updated_goal}">
+              <ComputePathToPose goal="{updated_goal}" path="{path}" planner_id="GridBased" />
+            </GoalUpdater>
+            <TruncatePath distance="0.0" input_path="{path}" output_path="{truncated_path}" />
+          </Sequence>
+        </RateController>
+        <KeepRunningUntilFailure>
+          <FollowPath path="{truncated_path}" controller_id="FollowPath" />
+        </KeepRunningUntilFailure>
+      </PipelineSequence>
+      <Sequence name="Recovery">
+        <ClearEntireCostmap name="ClearLocalCostmap"
+          service_name="local_costmap/clear_entirely_local_costmap" />
+        <Wait wait_duration="1" />
+      </Sequence>
+    </RecoveryNode>
+  </BehaviorTree>
+</root>
