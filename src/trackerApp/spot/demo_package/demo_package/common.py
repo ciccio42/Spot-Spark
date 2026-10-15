@@ -32,9 +32,14 @@ CROP_BOTTOM_MARGIN_FRAC = 0  # fraction of the image height cut from the BOTTOM 
                                   # not on the crop itself. No TF involved.
 
 # Debug prints called for EVERY detection of EVERY frame: printing to the terminal in the
-# perception loop costs time, and the ReID components are now logged to a CSV by tracking_fsm
-# (REID_LOG_COMPONENTS). True = old behaviour.
+# perception loop costs time. True = old behaviour.
 DEBUG_PRINT_DEPTH = False
+
+# Depth of a detected person (box_center_depth): torso band of the box + low percentile
+DEPTH_BAND_X = (0.15, 0.85)      # fraction of the box width
+DEPTH_BAND_Y = (0.10, 0.50)      # fraction of the box height, from the top (head/shoulders/chest)
+DEPTH_PERCENTILE = 20            # low percentile: the person is the nearest surface in the band
+DEPTH_MIN_VALID_PIXELS = 20
 DEBUG_PRINT_REID = False
 
 
@@ -120,7 +125,8 @@ def box_center_depth(depth_image, box, min_valid_pixels=DEPTH_MIN_VALID_PIXELS, 
 
     valid = crop[(crop > 0.05) & np.isfinite(crop)]
     if DEBUG_PRINT_DEPTH:
-        print(f"Min valid value: {valid.min() if valid.size > 0 else 'N/A'}, Max valid value: {valid.max() if valid.size > 0 else 'N/A'}, Valid pixel count: {valid.size}")
+        print(f"Depth band: {valid.size} valid px, min {valid.min() if valid.size else 'N/A'}, "
+              f"p{DEPTH_PERCENTILE} {np.percentile(valid, DEPTH_PERCENTILE) if valid.size else 'N/A'}")
     if valid.size < min_valid_pixels:
         return None
     return float(np.percentile(valid, DEPTH_PERCENTILE))
@@ -200,7 +206,7 @@ def rich_neural_embedding_components(e1, e2, euclidean_scale=10.0, magnitude_sca
         euclidean_sim in (0, 1]:  1 / (1 + ||e1 - e2|| / euclidean_scale) — depends on direction
                                    AND on the norms: ||e1-e2||^2 = n1^2 + n2^2 - 2*n1*n2*cosine;
         magnitude_sim in (0, 1]:  1 / (1 + |n1 - n2| / magnitude_scale) — NORMS only, no direction.
-    None if an embedding is missing. Used by tracking_fsm to log them (REID_LOG_COMPONENTS)."""
+    None if an embedding is missing."""
     if e1 is None or e2 is None:
         return None
     n1 = np.linalg.norm(e1)

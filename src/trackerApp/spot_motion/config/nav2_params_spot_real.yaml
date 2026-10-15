@@ -55,7 +55,7 @@ controller_server:
       plugin: "nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController"
       # [REAL] 1.0 m/s in sim; on the real robot, close to people, start
       # conservatively. Raise it after the first tests (together with velocity_smoother).
-      desired_linear_vel: 0.6
+      desired_linear_vel: 0.83
       lookahead_dist: 0.9
       min_lookahead_dist: 0.6
       max_lookahead_dist: 1.2
