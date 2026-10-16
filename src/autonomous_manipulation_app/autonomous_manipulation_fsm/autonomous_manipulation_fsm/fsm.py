@@ -14,11 +14,11 @@ class State(Enum):
 
 # allowed transitions: state -> states reachable from it
 TRANSITIONS = {
-    State.IDLE:              {State.DETECT},
+    State.IDLE:              {State.DETECT, State.PICK, State.NAVIGATE_TO_PLACE, State.ERROR},
     State.DETECT:            {State.NAVIGATE_TO_PICK, State.PICK, State.DETECT, State.ERROR},
     State.NAVIGATE_TO_PICK:  {State.PICK, State.DETECT, State.ERROR},
     State.PICK:              {State.NAVIGATE_TO_PLACE, State.DETECT, State.ERROR},
-    State.NAVIGATE_TO_PLACE: {State.PLACE, State.ERROR},
+    State.NAVIGATE_TO_PLACE: {State.PLACE, State.IDLE, State.ERROR},
     State.PLACE:             {State.RETURN_TO_IDLE, State.ERROR},
     State.RETURN_TO_IDLE:    {State.IDLE, State.ERROR},
     State.ERROR:             {State.IDLE},

@@ -1,0 +1,72 @@
+# hand in body, saved 2026-10-16 13:01:04
+safe:
+  position:
+    x: 0.6034
+    y: 0.0100
+    z: 0.2224
+  orientation:
+    x: -0.0224
+    y: 0.1960
+    z: 0.0198
+    w: 0.9802
+
+# hand in body, saved 2026-10-16 13:01:41
+post_pick_1:
+  position:
+    x: 0.3088
+    y: 0.3238
+    z: 0.2187
+  orientation:
+    x: -0.1330
+    y: 0.1489
+    z: 0.6750
+    w: 0.7103
+
+# hand in body, saved 2026-10-16 13:01:53
+post_pick_2:
+  position:
+    x: -0.0287
+    y: 0.0179
+    z: 0.2419
+  orientation:
+    x: -0.1651
+    y: -0.0128
+    z: 0.9860
+    w: 0.0216
+
+# hand in body, saved 2026-10-16 13:02:07
+pre_place_1:
+  position:
+    x: -0.1815
+    y: 0.0239
+    z: 0.3730
+  orientation:
+    x: -0.1662
+    y: -0.0154
+    z: 0.9857
+    w: 0.0212
+
+# hand in body, saved 2026-10-16 13:03:00
+pre_place_2:
+  position:
+    x: -0.1672
+    y: 0.0197
+    z: 0.3734
+  orientation:
+    x: -0.6118
+    y: -0.0035
+    z: 0.7906
+    w: 0.0255
+
+# hand in body, saved 2026-10-16 13:03:09
+pre_open_gripper:
+  position:
+    x: -0.1858
+    y: 0.0204
+    z: 0.2591
+  orientation:
+    x: -0.6103
+    y: -0.0038
+    z: 0.7918
+    w: 0.0245
+

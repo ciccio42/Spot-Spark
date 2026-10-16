@@ -36,6 +36,9 @@ class DetectorNode(Node):
         self.declare_parameter("target_class", "tennis_ball")
         # if true the service returns bbox/center normalized in [0, 1], otherwise in pixels
         self.declare_parameter("normalized", False)
+        # live cv2 window with the camera image, the detections and the target sent by the service
+        self.declare_parameter("show_image", True)
+        self.declare_parameter("window_name", "hand camera - detections")
 
         
         self.checkpoint = self.get_parameter("checkpoint").get_parameter_value().string_value
@@ -48,6 +51,8 @@ class DetectorNode(Node):
         self.conf_threshold = self.get_parameter("conf_threshold").get_parameter_value().double_value
         self.target_class = self.get_parameter("target_class").get_parameter_value().string_value
         self.normalized = self.get_parameter("normalized").get_parameter_value().bool_value
+        self.show_image = self.get_parameter("show_image").get_parameter_value().bool_value
+        self.window_name = self.get_parameter("window_name").get_parameter_value().string_value
         
         self.detector = Detector(self.model_path, device=self.device)
         self.get_logger().info(f"[{self.get_name()}] DetectorNode initialized with model: {self.model_path} on device: {self.device}")
@@ -93,6 +98,20 @@ class DetectorNode(Node):
             self.detection_callback,
             callback_group=MutuallyExclusiveCallbackGroup())
         self.get_logger().info(f"[{self.get_name()}] Detection service ready on: {self.service.srv_name}")
+
+        # cv2 window: image_callback only stores the frame to show, a dedicated thread owns the window
+        # (imshow/waitKey always from the same thread, never blocking the ROS callbacks)
+        self.display_frame = None
+        self.display_lock = threading.Lock()
+        self.display_stop = threading.Event()
+        self.display_thread = None
+        if self.show_image:
+            if not os.environ.get("DISPLAY"):
+                self.get_logger().warn(f"[{self.get_name()}] show_image is true but DISPLAY is not set: "
+                                       f"no window (export DISPLAY=:2 and xhost +local:docker on the host)")
+            else:
+                self.display_thread = threading.Thread(target=self.display_loop, daemon=True)
+                self.display_thread.start()
         
 
     def image_callback(self, msg):
@@ -109,6 +128,7 @@ class DetectorNode(Node):
         results = self.detector.detect(frame)
         if not results:
             self.get_logger().warn(f"[{self.get_name()}] Detector returned no results")
+            self.set_display_frame(frame, None, msg.header.frame_id)
             with self.detection_lock:
                 self.last_detection = None
                 self.frame_processed = True
@@ -150,6 +170,8 @@ class DetectorNode(Node):
             self.last_frame_id = msg.header.frame_id
             self.last_stamp = msg.header.stamp
 
+        self.set_display_frame(r.plot(), best, msg.header.frame_id)
+
         if not detections:
             self.get_logger().info(f"[{self.get_name()}] No detections above conf {self.conf_threshold:.2f}")
             return
@@ -164,6 +186,45 @@ class DetectorNode(Node):
                 f"center=({cx:.0f}, {cy:.0f}) size=({w:.0f}x{h:.0f}) "
                 f"bbox=({x1:.0f}, {y1:.0f}, {x2:.0f}, {y2:.0f})")
 
+
+    def set_display_frame(self, image, best, frame_id):
+        """Annotates the image with the target returned by the service and hands it to the window."""
+        if self.display_thread is None:
+            return
+        view = image.copy()
+        if best is not None:
+            x1, y1, x2, y2 = (int(v) for v in best["bbox"])
+            cx, cy = (int(v) for v in best["center"])
+            cv2.rectangle(view, (x1, y1), (x2, y2), (0, 255, 0), 3)
+            cv2.drawMarker(view, (cx, cy), (0, 255, 0), cv2.MARKER_CROSS, 20, 2)
+            label = f"TARGET {best['conf']:.2f} ({cx}, {cy})"
+            status = (0, 255, 0)
+        else:
+            label = f"no {self.target_class}"
+            status = (0, 0, 255)
+        cv2.putText(view, label, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, status, 2)
+        cv2.putText(view, frame_id, (10, view.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        with self.display_lock:
+            self.display_frame = view
+
+    def display_loop(self):
+        """Owns the cv2 window: shows the latest annotated frame (~30 Hz)."""
+        try:
+            cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
+            while not self.display_stop.is_set():
+                with self.display_lock:
+                    view, self.display_frame = self.display_frame, None
+                if view is not None:
+                    cv2.imshow(self.window_name, view)
+                cv2.waitKey(30)
+        except cv2.error as e:
+            # e.g. opencv-python-headless (no GUI support) or no X server reachable
+            self.get_logger().warn(f"[{self.get_name()}] cv2 window not available, image display disabled: {e}")
+        finally:
+            try:
+                cv2.destroyAllWindows()
+            except cv2.error:
+                pass
 
     @staticmethod
     def normalize_class(name):
@@ -219,8 +280,11 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
+        node.display_stop.set()
+        if node.display_thread is not None:
+            node.display_thread.join(timeout=1.0)
         node.destroy_node()
-        rclpy.shutdown()
+        rclpy.try_shutdown()
 
 
 if __name__ == "__main__":

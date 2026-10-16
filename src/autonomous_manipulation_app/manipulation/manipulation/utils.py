@@ -84,28 +84,16 @@ ARM_CAMERA_EDGES = tuple(
 
 # ===== ODOM TO HAND CAMERA CHAIN =====
 # Includes both static and dynamic connections.
+# (parent, child) pairs of the FrameTreeSnapshot: every frame can have ONE parent only,
+# the tree is rooted at body (added as child of "" in _create_frame_tree_snapshot):
+#   body -> odom, body -> vision, body -> arm_link_wr1 -> hand_color_image_sensor
 
-ODOM_TO_HAND_CAMERA_CHAIN = (
-    ODOM_FRAME,
-    BODY_FRAME,
-    ARM_SH0_FRAME,
-    ARM_SH1_FRAME,
-    ARM_HR0_FRAME,
-    ARM_EL0_FRAME,
-    ARM_EL1_FRAME,
-    ARM_WR0_FRAME,
-    ARM_WR1_FRAME,
-    HAND_CAMERA_FRAME,
+BODY_TO_HAND_CAMERA_EDGES = (
+    (BODY_FRAME, ODOM_FRAME),
+    (BODY_FRAME, VISION_FRAME),
+    (BODY_FRAME, ARM_WR1_FRAME),
+    (ARM_WR1_FRAME, HAND_CAMERA_FRAME),
 )
-
-# Consecutive (parent, child) pairs.
-ODOM_TO_HAND_CAMERA_EDGES = tuple(
-    zip(
-        ODOM_TO_HAND_CAMERA_CHAIN[:-1],
-        ODOM_TO_HAND_CAMERA_CHAIN[1:],
-    )
-)
-
 
 # ===== CAMERA INTRINSICS =====
 

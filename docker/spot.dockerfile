@@ -21,7 +21,15 @@ RUN pip3 install --no-cache-dir --upgrade pip \
     bosdyn-api==5.0.1 \
     bosdyn-core==5.0.1
 
-RUN apt update && apt install -y ros-${ROS_DISTRO}-robot-localization \
+# aiortc: required by the spot_ros2 driver (WebRTC camera streams)
+RUN pip3 install --no-cache-dir aiortc
+
+# image-transport-plugins: compressed image topics (e.g. /camera/hand/compressed)
+# pointcloud-to-laserscan: front depth clouds -> LaserScan for the Nav2 costmaps (spot_motion/depth_launch.py)
+RUN apt update && apt install -y \
+    ros-${ROS_DISTRO}-robot-localization \
+    ros-${ROS_DISTRO}-image-transport-plugins \
+    ros-${ROS_DISTRO}-pointcloud-to-laserscan \
     && rm -rf /var/lib/apt/lists/*
 
 RUN mkdir -p /home/spot_ws/src

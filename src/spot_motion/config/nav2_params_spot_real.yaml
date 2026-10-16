@@ -46,6 +46,8 @@ controller_server:
     general_goal_checker:
       plugin: "nav2_controller::SimpleGoalChecker"
       xy_goal_tolerance: 0.30
+      # any final orientation. A tight value (e.g. 0.15) needs use_rotate_to_heading: true, which
+      # blocked the return home (the robot could not do the ~180 deg in-place turn at the start)
       yaw_goal_tolerance: 3.14
       stateful: True
 
@@ -77,6 +79,8 @@ controller_server:
       cost_scaling_gain: 1.0
       use_collision_detection: true
       max_allowed_time_to_collision_up_to_carrot: 1.5
+      # false: with true the robot has to turn in place towards the path at the start (> 45 deg) and
+      # towards the goal heading at the end; the ~180 deg turn of the return home never started
       use_rotate_to_heading: false
       rotate_to_heading_angular_vel: 0.5
       rotate_to_heading_min_angle: 0.785
@@ -99,7 +103,7 @@ local_costmap:
       resolution: 0.05
       # Footprint of the real robot WITH the arm stretched forward (hand camera).
       # The narrow "nose" covers arm and gripper: the front cameras see them, and
-      # the cells inside the footprint are cleared (footprint_clearing_enabled).
+      # the cells inside the footprint are cleared (footprint_clearing_enabled, default true).
       # 1.05 = hand overhang + ~10 cm: MEASURE IT with
       #   ros2 run tf2_ros tf2_echo body hand     (x of the translation)
       # and update the value here AND in the global_costmap.
@@ -110,65 +114,44 @@ local_costmap:
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: True
-        # To also use the hand camera, add cam_hand here
-        # (careful: it will see the followed person and mark them as an obstacle).
-        observation_sources: cam_frontleft cam_frontright clear_frontleft clear_frontright
-        cam_frontleft:
-          topic: /depth/frontleft/points
-          data_type: "PointCloud2"
+        # layer-level height filter (default 2.0, in odom): wide like the sources, the scan points
+        # sit at the flat_body height in odom, which drifts
+        max_obstacle_height: 10.0
+        # Sources = LaserScans made by launch/depth_launch.py from the front clouds, in
+        # flat_body: the floor is cut out THERE, so the odom drift in z no longer turns
+        # the floor into obstacles. The obstacle height band is set in depth_launch.py
+        # (min_height / max_height), NOT here: min/max_obstacle_height below are wide
+        # on purpose (the scan points sit at the flat_body height in odom, which drifts).
+        # 'inf' beams (no return) clear the whole beam up to raytrace_max_range:
+        # this is the continuous refresh the old clear_* sources did with the floor rays.
+        observation_sources: scan_frontleft scan_frontright
+        scan_frontleft:
+          topic: /scan/frontleft
+          data_type: "LaserScan"
           marking: True
           clearing: True
-          min_obstacle_height: 0.50
-          max_obstacle_height: 2.0
+          inf_is_valid: True
+          min_obstacle_height: -10.0
+          max_obstacle_height: 10.0
           obstacle_max_range: 2.5
           raytrace_max_range: 3.0
-        cam_frontright:
-          topic: /depth/frontright/points
-          data_type: "PointCloud2"
+        scan_frontright:
+          topic: /scan/frontright
+          data_type: "LaserScan"
           marking: True
           clearing: True
-          min_obstacle_height: 0.50
-          max_obstacle_height: 2.0
+          inf_is_valid: True
+          min_obstacle_height: -10.0
+          max_obstacle_height: 10.0
           obstacle_max_range: 2.5
           raytrace_max_range: 3.0
-        # --- CLEARING ONLY (continuous refresh) -----------------------------
-        # Same clouds, marking: False. The height band includes the floor: the
-        # camera -> floor rays cross every cell in front of the robot and clear
-        # them on EVERY cloud (~2-3 Hz). An obstacle that moves or leaves
-        # INSIDE the field of view disappears on the next cloud. The cam_*
-        # sources above immediately mark again whatever is really there.
-        clear_frontleft:
-          topic: /depth/frontleft/points
-          data_type: "PointCloud2"
-          marking: False
-          clearing: True
-          min_obstacle_height: -0.30
-          max_obstacle_height: 2.0
-          raytrace_max_range: 4.0
-        clear_frontright:
-          topic: /depth/frontright/points
-          data_type: "PointCloud2"
-          marking: False
-          clearing: True
-          min_obstacle_height: -0.30
-          max_obstacle_height: 2.0
-          raytrace_max_range: 4.0
-        cam_hand:
-          topic: /depth/hand/points
-          data_type: "PointCloud2"
-          marking: True
-          clearing: True
-          min_obstacle_height: 0.18
-          max_obstacle_height: 2.0
-          obstacle_max_range: 3.5
-          raytrace_max_range: 4.0
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         # Same as in simulation. With 0.40 (old real value) the cost vanished almost
         # right past the inscribed radius (0.35): the planner grazed the obstacles
         # and the footprint corners / the arm ended up in lethal cells
         # -> "RegulatedPurePursuitController detected collision ahead!".
-        inflation_radius: 1.0
+        inflation_radius: 0.5
         cost_scaling_factor: 3.0
 
 global_costmap:
@@ -192,47 +175,37 @@ global_costmap:
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: True
-        observation_sources: cam_frontleft cam_frontright clear_frontleft clear_frontright
-        cam_frontleft:
-          topic: /depth/frontleft/points
-          data_type: "PointCloud2"
+        # layer-level height filter (default 2.0, in odom): wide like the sources, the scan points
+        # sit at the flat_body height in odom, which drifts
+        max_obstacle_height: 10.0
+        # Sources = LaserScans made by launch/depth_launch.py from the front clouds, in
+        # flat_body: the floor is cut out THERE, so the odom drift in z no longer turns
+        # the floor into obstacles. The obstacle height band is set in depth_launch.py
+        # (min_height / max_height), NOT here: min/max_obstacle_height below are wide
+        # on purpose (the scan points sit at the flat_body height in odom, which drifts).
+        # 'inf' beams (no return) clear the whole beam up to raytrace_max_range:
+        # this is the continuous refresh the old clear_* sources did with the floor rays.
+        observation_sources: scan_frontleft scan_frontright
+        scan_frontleft:
+          topic: /scan/frontleft
+          data_type: "LaserScan"
           marking: True
           clearing: True
-          min_obstacle_height: 0.50
-          max_obstacle_height: 2.0
+          inf_is_valid: True
+          min_obstacle_height: -10.0
+          max_obstacle_height: 10.0
           obstacle_max_range: 2.5
           raytrace_max_range: 3.0
-        cam_frontright:
-          topic: /depth/frontright/points
-          data_type: "PointCloud2"
+        scan_frontright:
+          topic: /scan/frontright
+          data_type: "LaserScan"
           marking: True
           clearing: True
-          min_obstacle_height: 0.50
-          max_obstacle_height: 2.0
+          inf_is_valid: True
+          min_obstacle_height: -10.0
+          max_obstacle_height: 10.0
           obstacle_max_range: 2.5
           raytrace_max_range: 3.0
-        # --- CLEARING ONLY (continuous refresh) -----------------------------
-        # Same clouds, marking: False. The height band includes the floor: the
-        # camera -> floor rays cross every cell in front of the robot and clear
-        # them on EVERY cloud (~2-3 Hz). An obstacle that moves or leaves
-        # INSIDE the field of view disappears on the next cloud. The cam_*
-        # sources above immediately mark again whatever is really there.
-        clear_frontleft:
-          topic: /depth/frontleft/points
-          data_type: "PointCloud2"
-          marking: False
-          clearing: True
-          min_obstacle_height: -0.30
-          max_obstacle_height: 2.0
-          raytrace_max_range: 4.0
-        clear_frontright:
-          topic: /depth/frontright/points
-          data_type: "PointCloud2"
-          marking: False
-          clearing: True
-          min_obstacle_height: -0.30
-          max_obstacle_height: 2.0
-          raytrace_max_range: 4.0
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         # Same as in simulation. With 0.40 (old real value) the cost vanished almost
@@ -254,6 +227,12 @@ planner_server:
 behavior_server:
   ros__parameters:
     use_sim_time: False
+    # same frames as the costmaps (the Nav2 defaults are odom / base_link): spin and backup measure
+    # the motion done on TF global_frame -> robot_base_frame
+    global_frame: odom
+    robot_base_frame: body
+    # default 0.1 s: under load the TF arrives later and the behaviors lose the robot pose
+    transform_tolerance: 0.5
     behavior_plugins: ["spin", "backup", "wait"]
     spin:
       plugin: "nav2_behaviors/Spin"

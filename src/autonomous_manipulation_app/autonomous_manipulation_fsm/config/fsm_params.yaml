@@ -69,6 +69,43 @@ fsm_node:
         z: -0.018
         w: 0.878
 
+    # --------- place (NAVIGATE_TO_PLACE) ----------
+    # arm poses recorded with: ros2 run manipulation_interfaces save_arm_pose.py
+    arm_poses_file: "/home/spot_ws/src/autonomous_manipulation_app/arm_poses.yaml"
+    # poses of arm_poses_file commanded in order, then the gripper is opened
+    place_arm_sequence: ["safe", "post_pick_1", "post_pick_2", "pre_place_1", "pre_place_2", "pre_open_gripper"]
+    open_gripper_timeout: 10.0
+    # after opening: wait (s) for the object to drop, close the gripper, then stow the arm
+    place_release_delay: 1.0
+    # optional poses commanded before the stow, e.g. ["pre_place_1", "safe"]; [""] = stow directly
+    post_place_arm_sequence: [""]
+
+    # --------- end of cycle ----------
+    # after the place the robot goes back to the initial position (saved when the cycle starts) and sits;
+    # it stands up again when the next cycle is started
+    sit_service: "sit"
+    stand_service: "stand"
+    posture_timeout: 15.0
+    # final in-place turn to the start orientation (Nav2 accepts any heading), via cmd_vel
+    align_home_yaw: true
+    cmd_vel_topic: "/cmd_vel"
+    align_yaw_tolerance: 0.087     # rad (~5 deg)
+    align_gain: 1.0                # rad/s per rad of error
+    align_max_angular_vel: 0.5     # rad/s
+    align_min_angular_vel: 0.15    # rad/s
+    align_timeout: 20.0            # s
+    # before the return navigation: turn in place towards the initial position (no large curve);
+    # skipped when closer than face_goal_min_distance (m)
+    face_goal_before_navigation: true
+    face_goal_min_distance: 0.5
+
+    # --------- lease ----------
+    # spot_driver claim service called in the constructor (needed with auto_claim: False in spot.yaml)
+    claim_service: "claim"
+    claim_timeout: 10.0
+    # claim the lease again before every arm move and every navigation
+    claim_before_motion: true
+
     # --------- shutdown ----------
     # Trigger service called on Ctrl+C / SIGTERM from any state to reset the arm (spot_driver)
     arm_reset_service: "arm_stow"

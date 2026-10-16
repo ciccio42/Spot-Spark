@@ -22,6 +22,12 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   DEPENDENCIES std_msgs geometry_msgs builtin_interfaces bosdyn_api_msgs
 )
 
+# tool to record arm poses (hand in body) for MoveArmToPose / fsm_params.yaml
+install(PROGRAMS
+  scripts/save_arm_pose.py
+  DESTINATION lib/${PROJECT_NAME}
+)
+
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
   # the following line skips the linter which checks for copyrights
