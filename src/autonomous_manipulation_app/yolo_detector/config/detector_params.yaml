@@ -10,3 +10,5 @@ detection_node:
     normalized: false              # true: bbox/center in [0, 1], false: pixels
     show_image: true               # live cv2 window (needs DISPLAY, e.g. :2 with the VNC server)
     window_name: "hand camera - detections"
+    confirmation_request_window: 2.0   # s: clicks count as confirmation only while a client is asking for one
+    pick_target_topic: "/fsm_node/pick_target"   # pixel sent to Manipulation, shown in the "pick target" window

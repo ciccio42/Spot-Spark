@@ -40,6 +40,14 @@ fsm_node:
 
     # ---------- timeouts (s) ----------
     detection_timeout: 15.0
+    # every detection (far and near) must be confirmed by the operator with a click on the ball in the
+    # yolo_detector window; confirmation_timeout replaces detection_timeout while waiting for the click
+    require_operator_confirmation: true
+    confirmation_timeout: 120.0
+    # near detection: pick at the pixel clicked by the operator instead of the bbox center
+    pick_at_click_point: true
+    # pixel sent to Manipulation, shown by yolo_detector in its "pick target" window
+    pick_target_topic: "/fsm_node/pick_target"
     navigation_timeout: 60.0
 
     # read Enter from the terminal to start (works with ros2 run and ros2 launch);

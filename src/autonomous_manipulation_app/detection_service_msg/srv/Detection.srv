@@ -1,7 +1,10 @@
-# Trigger-like service: empty request, returns the best tennis ball
-# detection (highest confidence) found in the last processed frame.
-# If the last frame contains no tennis ball, success is false and all
-# numeric fields are set to -1.
+# Returns the best tennis ball detection (highest confidence) found in the last processed frame.
+# If the last frame contains no tennis ball, success is false and all numeric fields are set to -1.
+#
+# require_confirmation: the detection must be confirmed by the operator with a click on the ball in
+# the detector cv2 window. Until then success is false ("waiting for operator confirmation"); after
+# the click the clicked detection is returned ONCE (the confirmation is consumed).
+bool require_confirmation
 ---
 bool success
 string message
@@ -21,3 +24,7 @@ float32 y2
 # bounding box center
 float32 center_x
 float32 center_y
+# point clicked by the operator to confirm the detection, ALWAYS in pixels of the image
+# (-1 when the detection was not confirmed with a click)
+float32 click_x
+float32 click_y

@@ -10,6 +10,7 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.wait_for_message import wait_for_message
 from sensor_msgs.msg import CompressedImage
+from geometry_msgs.msg import PointStamped
 import cv2
 import numpy as np
 from cv_bridge import CvBridge
@@ -39,6 +40,11 @@ class DetectorNode(Node):
         # live cv2 window with the camera image, the detections and the target sent by the service
         self.declare_parameter("show_image", True)
         self.declare_parameter("window_name", "hand camera - detections")
+        # a click is accepted as a confirmation only if a client asked for one in the last
+        # confirmation_request_window seconds (the FSM asks continuously while waiting)
+        self.declare_parameter("confirmation_request_window", 2.0)
+        # pixel the FSM sends to Manipulation, drawn in the "pick target" window
+        self.declare_parameter("pick_target_topic", "/fsm_node/pick_target")
 
         
         self.checkpoint = self.get_parameter("checkpoint").get_parameter_value().string_value
@@ -53,6 +59,8 @@ class DetectorNode(Node):
         self.normalized = self.get_parameter("normalized").get_parameter_value().bool_value
         self.show_image = self.get_parameter("show_image").get_parameter_value().bool_value
         self.window_name = self.get_parameter("window_name").get_parameter_value().string_value
+        self.confirmation_request_window = (
+            self.get_parameter("confirmation_request_window").get_parameter_value().double_value)
         
         self.detector = Detector(self.model_path, device=self.device)
         self.get_logger().info(f"[{self.get_name()}] DetectorNode initialized with model: {self.model_path} on device: {self.device}")
@@ -102,7 +110,21 @@ class DetectorNode(Node):
         # cv2 window: image_callback only stores the frame to show, a dedicated thread owns the window
         # (imshow/waitKey always from the same thread, never blocking the ROS callbacks)
         self.display_frame = None
+        # targets / frame_id / stamp of the frame currently shown in the window (for the mouse clicks)
+        self.shown_frame = None
         self.display_lock = threading.Lock()
+        # operator confirmation: detection clicked in the window, returned once by the service
+        # (guarded by detection_lock); time of the last service call asking for a confirmation
+        self.confirmed = None
+        self.confirmation_requested_at = 0.0
+        # "pick target" window: frozen image of the last confirmation (bbox center, click) and the pixel
+        # the FSM sent to Manipulation; redrawn only when pick_view_dirty is set (guarded by display_lock)
+        self.pick_snapshot = None
+        self.sent_target = None
+        self.pick_view_dirty = False
+        self.create_subscription(PointStamped,
+                                 self.get_parameter("pick_target_topic").get_parameter_value().string_value,
+                                 self.pick_target_callback, 10)
         self.display_stop = threading.Event()
         self.display_thread = None
         if self.show_image:
@@ -128,7 +150,7 @@ class DetectorNode(Node):
         results = self.detector.detect(frame)
         if not results:
             self.get_logger().warn(f"[{self.get_name()}] Detector returned no results")
-            self.set_display_frame(frame, None, msg.header.frame_id)
+            self.set_display_frame(frame, [], None, msg.header.frame_id, msg.header.stamp)
             with self.detection_lock:
                 self.last_detection = None
                 self.frame_processed = True
@@ -170,7 +192,7 @@ class DetectorNode(Node):
             self.last_frame_id = msg.header.frame_id
             self.last_stamp = msg.header.stamp
 
-        self.set_display_frame(r.plot(), best, msg.header.frame_id)
+        self.set_display_frame(r.plot(), targets, best, msg.header.frame_id, msg.header.stamp)
 
         if not detections:
             self.get_logger().info(f"[{self.get_name()}] No detections above conf {self.conf_threshold:.2f}")
@@ -187,8 +209,9 @@ class DetectorNode(Node):
                 f"bbox=({x1:.0f}, {y1:.0f}, {x2:.0f}, {y2:.0f})")
 
 
-    def set_display_frame(self, image, best, frame_id):
-        """Annotates the image with the target returned by the service and hands it to the window."""
+    def set_display_frame(self, image, targets, best, frame_id, stamp):
+        """Annotates the image with the target returned by the service and hands it to the window,
+        together with the frame data the mouse clicks refer to."""
         if self.display_thread is None:
             return
         view = image.copy()
@@ -204,18 +227,43 @@ class DetectorNode(Node):
             status = (0, 0, 255)
         cv2.putText(view, label, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, status, 2)
         cv2.putText(view, frame_id, (10, view.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+        base = view.copy()
+
+        # operator confirmation banner
+        with self.detection_lock:
+            confirmed = self.confirmed is not None
+        if confirmed:
+            banner, color = "CONFIRMED - robot moving on (right click = cancel)", (255, 255, 0)
+        elif self.confirmation_pending():
+            banner, color = "CLICK ON THE BALL TO CONFIRM", (0, 255, 255)
+        else:
+            banner = None
+        if banner:
+            cv2.putText(view, banner, (10, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+
         with self.display_lock:
-            self.display_frame = view
+            self.display_frame = (view, {"targets": targets, "frame_id": frame_id, "stamp": stamp, "image": base})
 
     def display_loop(self):
         """Owns the cv2 window: shows the latest annotated frame (~30 Hz)."""
         try:
             cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
+            # clicks are delivered by waitKey below, i.e. in this thread
+            cv2.setMouseCallback(self.window_name, self.on_mouse)
             while not self.display_stop.is_set():
                 with self.display_lock:
-                    view, self.display_frame = self.display_frame, None
-                if view is not None:
+                    item, self.display_frame = self.display_frame, None
+                if item is not None:
+                    view, meta = item
                     cv2.imshow(self.window_name, view)
+                    with self.display_lock:
+                        self.shown_frame = meta
+                with self.display_lock:
+                    dirty, self.pick_view_dirty = self.pick_view_dirty, False
+                    snapshot, sent = self.pick_snapshot, self.sent_target
+                if dirty and snapshot is not None:
+                    cv2.imshow(f"{self.window_name} - pick target", self.draw_pick_view(snapshot, sent))
                 cv2.waitKey(30)
         except cv2.error as e:
             # e.g. opencv-python-headless (no GUI support) or no X server reachable
@@ -226,12 +274,132 @@ class DetectorNode(Node):
             except cv2.error:
                 pass
 
+    def pick_target_callback(self, msg):
+        """Pixel the FSM is sending to Manipulation: drawn in the "pick target" window."""
+        with self.display_lock:
+            self.sent_target = msg
+            self.pick_view_dirty = True
+
+    def draw_pick_view(self, snapshot, sent):
+        """Frozen confirmed image with bbox center, operator click, their difference and the pixel sent
+        to Manipulation."""
+        view = snapshot["image"].copy()
+        det = snapshot["det"]
+        x1, y1, x2, y2 = (int(v) for v in det["bbox"])
+        cx, cy = (int(round(v)) for v in det["center"])
+        kx, ky = snapshot["click"]
+        dx, dy = kx - cx, ky - cy
+
+        cv2.rectangle(view, (x1, y1), (x2, y2), (0, 255, 0), 1)
+        cv2.drawMarker(view, (cx, cy), (0, 255, 0), cv2.MARKER_CROSS, 18, 2)        # bbox center: green
+        cv2.circle(view, (kx, ky), 7, (255, 0, 255), 2)                             # click: magenta
+        if (dx, dy) != (0, 0):
+            cv2.arrowedLine(view, (cx, cy), (kx, ky), (0, 255, 255), 1, tipLength=0.3)
+
+        lines = [
+            (f"bbox center : ({cx}, {cy})", (0, 255, 0)),
+            (f"click       : ({kx}, {ky})", (255, 0, 255)),
+            (f"click-center: ({dx:+d}, {dy:+d}) = {np.hypot(dx, dy):.1f} px", (0, 255, 255)),
+        ]
+        if sent is None:
+            lines.append(("to Manipulation: not sent yet", (200, 200, 200)))
+        else:
+            sx, sy = int(round(sent.point.x)), int(round(sent.point.y))
+            same_image = (sent.header.stamp.sec == snapshot["stamp"].sec
+                          and sent.header.stamp.nanosec == snapshot["stamp"].nanosec)
+            cv2.drawMarker(view, (sx, sy), (0, 0, 255), cv2.MARKER_TILTED_CROSS, 22, 2)  # sent: red
+            source = ("= click" if (sx, sy) == (kx, ky) else
+                      "= bbox center" if (sx, sy) == (cx, cy) else "")
+            lines.append((f"to Manipulation: ({sx}, {sy}) {source}"
+                          f"{'' if same_image else '  (OTHER IMAGE!)'}", (0, 0, 255)))
+
+        # text block with a dark background, bottom left
+        line_h, pad = 22, 6
+        top = view.shape[0] - pad - line_h * len(lines) - pad
+        cv2.rectangle(view, (0, top), (min(view.shape[1], 470), view.shape[0]), (0, 0, 0), -1)
+        for i, (text, color) in enumerate(lines):
+            cv2.putText(view, text, (pad, top + pad + line_h * (i + 1) - 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 1)
+        return view
+
+    def confirmation_pending(self):
+        """True if a client asked for an operator confirmation recently."""
+        return time() - self.confirmation_requested_at <= self.confirmation_request_window
+
+    def on_mouse(self, event, x, y, flags, param):
+        """Left click on a detected ball = confirmation; right click = cancel the confirmation.
+        x, y are in pixels of the shown image."""
+        if event == cv2.EVENT_RBUTTONDOWN:
+            with self.detection_lock:
+                had = self.confirmed is not None
+                self.confirmed = None
+            if had:
+                self.get_logger().info(f"[{self.get_name()}] Operator cancelled the confirmation")
+            return
+        if event != cv2.EVENT_LBUTTONDOWN:
+            return
+        if not self.confirmation_pending():
+            self.get_logger().info(f"[{self.get_name()}] Click ignored: no confirmation requested right now")
+            return
+        with self.display_lock:
+            shown = self.shown_frame
+        if shown is None:
+            return
+        # the clicked ball: the most confident target whose bbox contains the click
+        hits = [d for d in shown["targets"]
+                if d["bbox"][0] <= x <= d["bbox"][2] and d["bbox"][1] <= y <= d["bbox"][3]]
+        if not hits:
+            self.get_logger().warn(f"[{self.get_name()}] Click at ({x}, {y}) is not on a detected "
+                                   f"{self.target_class}: click inside its box")
+            return
+        det = max(hits, key=lambda d: d["conf"])
+        with self.detection_lock:
+            self.confirmed = {"det": det, "frame_id": shown["frame_id"], "stamp": shown["stamp"],
+                              "click": (float(x), float(y))}
+        with self.display_lock:
+            self.pick_snapshot = {"image": shown["image"], "det": det, "click": (x, y),
+                                  "frame_id": shown["frame_id"], "stamp": shown["stamp"]}
+            self.sent_target = None
+            self.pick_view_dirty = True
+        cx, cy = det["center"]
+        self.get_logger().info(f"[{self.get_name()}] Operator confirmed {det['class']} conf={det['conf']:.2f} "
+                               f"center=({cx:.0f}, {cy:.0f}) click=({x}, {y})")
+
+    def fill_response(self, response, det, frame_id, stamp, message, click=None):
+        """Fills the Detection response with det (None = no ball: success false, values -1) and the
+        operator click (pixels, -1 if none)."""
+        response.click_x, response.click_y = click if click is not None else (-1.0, -1.0)
+        response.normalized = self.normalized
+        response.message = message
+        response.frame_id = frame_id
+        if stamp is not None:
+            response.stamp = stamp
+        if det is None:
+            response.success = False
+            response.class_name = ""
+            response.confidence = -1.0
+            response.x1 = response.y1 = response.x2 = response.y2 = -1.0
+            response.center_x = response.center_y = -1.0
+            return
+        x1, y1, x2, y2 = det["bbox_n"] if self.normalized else det["bbox"]
+        cx, cy = det["center_n"] if self.normalized else det["center"]
+        response.success = True
+        response.class_name = det["class"]
+        response.confidence = det["conf"]
+        response.x1, response.y1, response.x2, response.y2 = x1, y1, x2, y2
+        response.center_x, response.center_y = cx, cy
+
     @staticmethod
     def normalize_class(name):
         # "Tennis-Ball", "tennis ball" and "tennis_ball" are treated as the same class
         return name.lower().replace("-", "_").replace(" ", "_")
 
     def detection_callback(self, request, response):
+        if request.require_confirmation:
+            return self.confirmed_detection_callback(response)
+        # no operator click without confirmation
+        response.click_x = response.click_y = -1.0
+
         with self.detection_lock:
             best = self.last_detection
             frame_processed = self.frame_processed
@@ -265,6 +433,27 @@ class DetectorNode(Node):
             response.center_x, response.center_y = cx, cy
 
         self.get_logger().info(f"[{self.get_name()}] Detection service called: success={response.success}, {response.message}")
+        return response
+
+    def confirmed_detection_callback(self, response):
+        """Service answer when the operator confirmation is required: the clicked detection, once."""
+        self.confirmation_requested_at = time()
+        with self.detection_lock:
+            confirmed, self.confirmed = self.confirmed, None
+            frame_id, stamp = self.last_frame_id, self.last_stamp
+        if confirmed is None:
+            if self.display_thread is None:
+                message = ("Operator confirmation required but the detector window is disabled "
+                           "(show_image false or DISPLAY not set)")
+            else:
+                message = f"Waiting for operator confirmation: click on the ball in the '{self.window_name}' window"
+            self.fill_response(response, None, frame_id, stamp, message)
+            self.get_logger().info(f"[{self.get_name()}] {message}", throttle_duration_sec=5.0)
+            return response
+        det = confirmed["det"]
+        self.fill_response(response, det, confirmed["frame_id"], confirmed["stamp"],
+                           f"{det['class']} confirmed by the operator", click=confirmed["click"])
+        self.get_logger().info(f"[{self.get_name()}] Detection service: returning the confirmed {det['class']}")
         return response
 
 

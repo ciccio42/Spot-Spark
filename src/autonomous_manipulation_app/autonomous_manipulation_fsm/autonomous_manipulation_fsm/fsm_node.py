@@ -96,6 +96,16 @@ class FSMNode(Node):
         self.declare_parameter("min_nav_distance", 0.3)
         # seconds without a valid ball detection before going to ERROR
         self.declare_parameter("detection_timeout", 15.0)
+        # every detection (far: before the navigation, near: before the pick) must be confirmed by the
+        # operator with a click on the ball in the yolo_detector window: the robot never moves on its own
+        self.declare_parameter("require_operator_confirmation", True)
+        # seconds to wait for the operator click (replaces detection_timeout when the confirmation is required)
+        self.declare_parameter("confirmation_timeout", 120.0)
+        # near detection: the pick goal uses the pixel clicked by the operator instead of the bbox center
+        self.declare_parameter("pick_at_click_point", True)
+        # pixel sent to Manipulation (x, y in pixels, header = frame_id and stamp of the image),
+        # shown by yolo_detector in its "pick target" window
+        self.declare_parameter("pick_target_topic", "/fsm_node/pick_target")
         self.declare_parameter("navigation_timeout", 60.0)
         # BT used for the goal; empty = Nav2 default BT that ends with SUCCESS when the goal is reached
         # (the spot_motion default follow_point_spot.xml never ends, it is meant for person following)
@@ -123,6 +133,9 @@ class FSMNode(Node):
         self.standoff_distance = float(gp("standoff_distance"))
         self.min_nav_distance = float(gp("min_nav_distance"))
         self.detection_timeout = float(gp("detection_timeout"))
+        self.require_operator_confirmation = bool(gp("require_operator_confirmation"))
+        self.confirmation_timeout = float(gp("confirmation_timeout"))
+        self.pick_at_click_point = bool(gp("pick_at_click_point"))
         self.navigation_timeout = float(gp("navigation_timeout"))
         self.behavior_tree = gp("behavior_tree") or self.default_behavior_tree()
         self.use_stdin = bool(gp("use_stdin"))
@@ -146,6 +159,7 @@ class FSMNode(Node):
         self.face_goal_before_navigation = bool(gp("face_goal_before_navigation"))
         self.face_goal_min_distance = float(gp("face_goal_min_distance"))
         self.cmd_vel_pub = self.create_publisher(Twist, gp("cmd_vel_topic"), 10)
+        self.pick_target_pub = self.create_publisher(PointStamped, gp("pick_target_topic"), 10)
         # [""] is the "empty list" default (ROS 2 cannot infer the type of an empty list)
         self.post_place_arm_sequence = [name for name in gp("post_place_arm_sequence") if name]
         self.near_detection_pose = self.declare_pose_parameter("near_detection_pose")
@@ -453,11 +467,16 @@ class FSMNode(Node):
                                    f"detecting objects to pick.")
             pose = self.near_detection_pose if self.detection_mode == "near" else self.far_detection_pose
             self.move_arm_to_detection_pose(pose, open_gripper=True, close_gripper=False)
+            if self.require_operator_confirmation and self.fsm.state == State.DETECT:
+                self.get_logger().info(f"[{self.get_name()}] Waiting for the operator: click on the ball in the "
+                                       f"detector window to confirm it (the robot does not move until then)")
             return
 
         # Start Inference
-        if self.time_in_state() > self.detection_timeout:
-            self.get_logger().error(f"[{self.get_name()}] No ball located in {self.detection_timeout:.0f} s")
+        timeout = self.confirmation_timeout if self.require_operator_confirmation else self.detection_timeout
+        if self.time_in_state() > timeout:
+            what = "confirmed by the operator" if self.require_operator_confirmation else "located"
+            self.get_logger().error(f"[{self.get_name()}] No ball {what} in {timeout:.0f} s")
             self.fsm.transition(State.ERROR)
             return
 
@@ -467,7 +486,10 @@ class FSMNode(Node):
                 self.get_logger().info(f"[{self.get_name()}] Waiting for the detection service...",
                                        throttle_duration_sec=2.0)
                 return
-            self.pending = self.detection_client.call_async(Detection.Request())
+            request = Detection.Request()
+            # with the confirmation the detector answers success only after the operator click
+            request.require_confirmation = self.require_operator_confirmation
+            self.pending = self.detection_client.call_async(request)
             return
         if not self.pending.done():
             return
@@ -481,7 +503,12 @@ class FSMNode(Node):
         # the detector answers with its last processed frame: discard frames captured before the arm
         # reached the detection pose (state_start is reset when the arm is in position)
         if Time.from_msg(res.stamp) < self.state_start:
-            self.get_logger().info(f"[{self.get_name()}] Detection from an image taken before the arm was in " f"position, waiting for a new frame", throttle_duration_sec=1.0)
+            if self.require_operator_confirmation:
+                # the confirmation was consumed by this call: the operator has to click again
+                self.get_logger().warn(f"[{self.get_name()}] The confirmed ball comes from an image taken before "
+                                       f"the arm was in position: click on the ball again")
+            else:
+                self.get_logger().info(f"[{self.get_name()}] Detection from an image taken before the arm was in " f"position, waiting for a new frame", throttle_duration_sec=1.0)
             return
 
         self.get_logger().info(f"[{self.get_name()}] Detected {res.class_name} conf={res.confidence:.2f} " f"center=({res.center_x:.1f}, {res.center_y:.1f}) frame={res.frame_id}")
@@ -774,7 +801,15 @@ class FSMNode(Node):
         return out
 
     def pixel_target(self, res):
-        """Detection response -> bbox center in pixels of the detection image, None if not computable."""
+        """Detection response -> pick pixel in the detection image, None if not computable: the point
+        clicked by the operator (pick_at_click_point, click_x/click_y >= 0), otherwise the bbox center."""
+        if self.pick_at_click_point and res.click_x >= 0.0 and res.click_y >= 0.0:
+            # click_x / click_y are always in pixels
+            self.get_logger().info(f"[{self.get_name()}] Pick at the operator click ({res.click_x:.0f}, "
+                                   f"{res.click_y:.0f}) instead of the bbox center ({res.center_x:.0f}, "
+                                   f"{res.center_y:.0f})")
+            return {"frame_id": res.frame_id, "x_center": float(res.click_x), "y_center": float(res.click_y),
+                    "stamp": res.stamp}
         x, y = res.center_x, res.center_y
         # if res.normalized:
         #     if self.camera_info is None:
@@ -794,6 +829,13 @@ class FSMNode(Node):
             self.get_logger().error(f"[{self.get_name()}] Manipulate action server not available")
             self.fsm.transition(State.ERROR)
             return False
+
+        # show the pixel about to be sent (yolo_detector "pick target" window) before asking for Enter
+        target = PointStamped()
+        target.header.frame_id = goal.frame_id
+        target.header.stamp = goal.timestamp
+        target.point.x, target.point.y = float(goal.x_center), float(goal.y_center)
+        self.pick_target_pub.publish(target)
 
         # wait for Enter (or the start service) before starting the manipulation
         if not self.wait_for_confirmation("start picking"):
