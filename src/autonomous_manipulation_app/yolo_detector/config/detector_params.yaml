@@ -10,3 +10,7 @@ detection_node:
     normalized: false              # true: bbox/center in [0, 1], false: pixels
     show_image: true               # live cv2 window (needs DISPLAY, e.g. :2 with the VNC server)
     window_name: "hand camera - detections"
+    # left click on the window -> geometry_msgs/PointStamped (x/y in pixels) on this topic,
+    # used by the FSM as backup when the YOLO detection fails (click_fallback_*, needs show_image)
+    clicked_pixel_topic: "clicked_pixel"
+    click_marker_duration: 3.0     # s the clicked point stays drawn on the window

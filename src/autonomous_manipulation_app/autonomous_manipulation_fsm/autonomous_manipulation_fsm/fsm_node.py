@@ -115,6 +115,28 @@ class FSMNode(Node):
         self.declare_parameter("arm_stow_timeout", 10.0)
         # max time (s) to wait for the arm reset on shutdown
         self.declare_parameter("shutdown_timeout", 7.0)
+        # backup of the YOLO detection: if no target is detected in detection_timeout, DETECT waits for a
+        # pixel clicked on the yolo_detector window (published on clicked_pixel_topic) instead of going to ERROR
+        #   click_fallback_navigation: far detection, the clicked pixel + depth is the navigation target
+        #   click_fallback_pick: near detection, the clicked pixel is sent to the Manipulate action
+        self.declare_parameter("click_fallback_navigation", True)
+        self.declare_parameter("click_fallback_pick", True)
+        # confirmation of the YOLO detection: after a detection the operator must click inside the detected
+        # box on the yolo_detector window before the target is used
+        #   click_confirm_navigation: far detection (navigation target)
+        #   click_confirm_pick: near detection (pick target)
+        self.declare_parameter("click_confirm_navigation", False)
+        self.declare_parameter("click_confirm_pick", False)
+        # tolerance (px) around the detected box for the confirmation click
+        self.declare_parameter("click_confirm_margin", 20.0)
+        # click outside the box: "use_click" = the clicked point becomes the target (operator correction),
+        # "retry" = the detection is discarded and a new one is done
+        self.declare_parameter("click_confirm_outside_bbox", "use_click")
+        self.declare_parameter("clicked_pixel_topic", "clicked_pixel")
+        # half size (px) of the square around the clicked pixel used for the depth (median of valid values)
+        self.declare_parameter("click_depth_window", 5)
+        # seconds to wait for a click before going to ERROR (0 = wait forever)
+        self.declare_parameter("click_timeout", 120.0)
         
 
         gp = lambda name: self.get_parameter(name).value
@@ -151,6 +173,17 @@ class FSMNode(Node):
         self.near_detection_pose = self.declare_pose_parameter("near_detection_pose")
         self.close_gripper_service = gp("close_gripper_service")
         self.close_gripper_timeout = float(gp("detection_timeout"))
+        self.click_fallback = {"far": bool(gp("click_fallback_navigation")),
+                               "near": bool(gp("click_fallback_pick"))}
+        self.click_confirm = {"far": bool(gp("click_confirm_navigation")),
+                              "near": bool(gp("click_confirm_pick"))}
+        self.click_confirm_margin = float(gp("click_confirm_margin"))
+        self.click_confirm_outside_bbox = gp("click_confirm_outside_bbox")
+        if self.click_confirm_outside_bbox not in ("use_click", "retry"):
+            raise ValueError(f"Invalid click_confirm_outside_bbox '{self.click_confirm_outside_bbox}' "
+                             f"(expected 'use_click' or 'retry')")
+        self.click_depth_window = int(gp("click_depth_window"))
+        self.click_timeout = float(gp("click_timeout"))
         # ---------- dependencies ----------
         # take the robot lease before anything else: every arm / gripper / posture command needs it
         self.claim_lease(gp("claim_service"), float(gp("claim_timeout")))
@@ -248,6 +281,13 @@ class FSMNode(Node):
         self.depth_msg = None
         self.create_subscription(CameraInfo, gp("camera_info_topic"), self.camera_info_callback, 1)
         self.create_subscription(Image, gp("depth_topic"), self.depth_callback, 1)
+        # last pixel clicked on the yolo_detector window, consumed by DETECT when YOLO failed
+        self.clicked_pixel = None
+        # time DETECT started waiting for a click (YOLO failed or detection to confirm), None otherwise
+        self.click_wait_start = None
+        # YOLO detection response waiting for the operator's confirmation click, None otherwise
+        self.detection_to_confirm = None
+        self.create_subscription(PointStamped, gp("clicked_pixel_topic"), self.clicked_pixel_callback, 10)
 
         # ---------- FSM data ----------
         self.ball_point = None      # PointStamped of the ball in global_frame
@@ -291,6 +331,10 @@ class FSMNode(Node):
         self.timer = self.create_timer(1.0 / rate, self.step)
 
         self.get_logger().info(f"[{self.get_name()}] FSM started in state {self.fsm.state.name}")
+        self.get_logger().info(f"[{self.get_name()}] Click fallback after a failed detection: "
+                               f"navigation={self.click_fallback['far']}, pick={self.click_fallback['near']}")
+        self.get_logger().info(f"[{self.get_name()}] Click confirmation of the detection: "
+                               f"navigation={self.click_confirm['far']}, pick={self.click_confirm['near']}")
         self.get_logger().info(f"[{self.get_name()}] Nav2 behavior tree: {self.behavior_tree or '<bt_navigator default>'}")
 
     def claim_lease(self, service, timeout):
@@ -350,6 +394,9 @@ class FSMNode(Node):
 
     def depth_callback(self, msg):
         self.depth_msg = msg
+
+    def clicked_pixel_callback(self, msg):
+        self.clicked_pixel = msg
 
     def wait_for_enter(self):
         # the keyboard is read in a separate thread so the executor is never blocked.
@@ -453,10 +500,28 @@ class FSMNode(Node):
                                    f"detecting objects to pick.")
             pose = self.near_detection_pose if self.detection_mode == "near" else self.far_detection_pose
             self.move_arm_to_detection_pose(pose, open_gripper=True, close_gripper=False)
+            # YOLO first, the click is only the fallback or the confirmation of the detection
+            self.click_wait_start = None
+            self.detection_to_confirm = None
+            return
+
+        # YOLO detected the target: waiting for the operator to confirm it with a click
+        if self.detection_to_confirm is not None:
+            self.confirm_detection_with_click()
+            return
+
+        # YOLO failed: waiting for the target clicked on the yolo_detector window
+        if self.click_wait_start is not None:
+            self.detect_from_click()
             return
 
         # Start Inference
         if self.time_in_state() > self.detection_timeout:
+            if self.click_fallback[self.detection_mode]:
+                target = "navigation target" if self.detection_mode == "far" else "object to pick"
+                self.request_click(f"No ball located in {self.detection_timeout:.0f} s: "
+                                   f"click the {target} on the yolo_detector window")
+                return
             self.get_logger().error(f"[{self.get_name()}] No ball located in {self.detection_timeout:.0f} s")
             self.fsm.transition(State.ERROR)
             return
@@ -486,28 +551,144 @@ class FSMNode(Node):
 
         self.get_logger().info(f"[{self.get_name()}] Detected {res.class_name} conf={res.confidence:.2f} " f"center=({res.center_x:.1f}, {res.center_y:.1f}) frame={res.frame_id}")
 
+        # the operator confirms the detected target with a click before it is used
+        if self.click_confirm[self.detection_mode]:
+            x1, y1, x2, y2 = self.detection_bbox_px(res)
+            self.request_click(f"Confirm the {res.class_name} detected in ({x1:.0f}, {y1:.0f}, {x2:.0f}, "
+                               f"{y2:.0f}): click inside its box on the yolo_detector window")
+            self.detection_to_confirm = res
+            return
+
+        self.use_detection(res)
+
+    def use_detection(self, res):
+        """YOLO detection -> target of the current mode: bbox center in pixels for the pick (-> PICK),
+        3D point for the navigation (-> NAVIGATE_TO_PICK). Returns False if the 3D point is not available."""
         # near detection: the pick only needs the bbox center in pixels, go back to PICK
         if self.detection_mode == "near":
             target = self.pixel_target(res)
             if target is None:
-                return
+                return False
             self.pick_target = target
             self.get_logger().info(f"[{self.get_name()}] Pick target: center=({target['x_center']:.1f}, "
                                    f"{target['y_center']:.1f}) px in {target['frame_id']}")
             self.fsm.transition(State.PICK)
-            return
+            return True
 
         # far detection: 3D position of the ball for the navigation
         ball = self.locate_ball(res)
         if ball is None:
             # depth/intrinsics/TF not available yet: retry with a new detection at the next tick
-            return
+            return False
         self.ball_point = ball
         self.get_logger().info(f"[{self.get_name()}] Ball in {self.global_frame}: "
                                f"({ball.point.x:.2f}, {ball.point.y:.2f}, {ball.point.z:.2f})")
 
         # If detection is successful, transition to NAVIGATE_TO_PICK
         self.fsm.transition(State.NAVIGATE_TO_PICK)
+        return True
+
+    def use_click(self, click):
+        """Clicked pixel -> target of the current mode: the pixel for the pick (-> PICK), its 3D point for
+        the navigation (-> NAVIGATE_TO_PICK). Returns False if the 3D point is not available."""
+        u, v = click.point.x, click.point.y
+        # near: the pick only needs the pixel, the Manipulate action grasps what is there
+        if self.detection_mode == "near":
+            self.pick_target = {"frame_id": click.header.frame_id, "x_center": float(u), "y_center": float(v),
+                                "stamp": click.header.stamp}
+            self.fsm.transition(State.PICK)
+            return True
+
+        # far: 3D point of the clicked pixel, NAVIGATE_TO_PICK walks to standoff_distance from it
+        r = self.click_depth_window
+        target = self.locate_pixel_region(u - r, v - r, u + r, v + r, click.header.frame_id, shrink=1.0)
+        if target is None:
+            self.get_logger().warn(f"[{self.get_name()}] Cannot locate the clicked pixel in 3D, click again")
+            return False
+        self.ball_point = target
+        self.get_logger().info(f"[{self.get_name()}] Clicked target in {self.global_frame}: "
+                               f"({target.point.x:.2f}, {target.point.y:.2f}, {target.point.z:.2f})")
+        self.fsm.transition(State.NAVIGATE_TO_PICK)
+        return True
+
+    def request_click(self, message):
+        """Starts waiting for a click on the yolo_detector window: only clicks made from now on are used,
+        a pending detection is dropped."""
+        self.get_logger().warn(f"[{self.get_name()}] {message}")
+        self.clicked_pixel = None
+        self.pending = None
+        self.click_wait_start = self.get_clock().now()
+
+    def next_click(self):
+        """Valid click received since request_click(), None if there is none yet.
+        Goes to ERROR (and returns None) after click_timeout."""
+        waiting = (self.get_clock().now() - self.click_wait_start).nanoseconds * 1e-9
+        if self.click_timeout > 0.0 and waiting > self.click_timeout:
+            self.get_logger().error(f"[{self.get_name()}] No click received in {self.click_timeout:.0f} s")
+            self.fsm.transition(State.ERROR)
+            return None
+
+        click, self.clicked_pixel = self.clicked_pixel, None
+        if click is None:
+            self.get_logger().info(f"[{self.get_name()}] Waiting for a click on the yolo_detector window...",
+                                   throttle_duration_sec=5.0)
+            return None
+        u, v = click.point.x, click.point.y
+        # same check as the YOLO detection: the image must be taken with the arm in the detection pose
+        if Time.from_msg(click.header.stamp) < self.state_start:
+            self.get_logger().warn(f"[{self.get_name()}] Click at ({u:.0f}, {v:.0f}) on an image taken before "
+                                   f"the arm was in position, click again")
+            return None
+        self.get_logger().info(f"[{self.get_name()}] Clicked pixel ({u:.0f}, {v:.0f}) in {click.header.frame_id}")
+        return click
+
+    def detect_from_click(self):
+        """DETECT fallback after a failed YOLO detection: the target is the pixel clicked on the
+        yolo_detector window."""
+        click = self.next_click()
+        if click is not None:
+            self.use_click(click)
+
+    def confirm_detection_with_click(self):
+        """DETECT with click_confirm_*: the YOLO detection is used only after the operator clicks inside its
+        box (+ click_confirm_margin). A click outside the box, depending on click_confirm_outside_bbox,
+        makes the clicked point the target ("use_click") or discards the detection ("retry")."""
+        click = self.next_click()
+        if click is None:
+            return
+        res = self.detection_to_confirm
+        u, v = click.point.x, click.point.y
+        x1, y1, x2, y2 = self.detection_bbox_px(res)
+        m = self.click_confirm_margin
+        if x1 - m <= u <= x2 + m and y1 - m <= v <= y2 + m:
+            self.get_logger().info(f"[{self.get_name()}] Detection confirmed by the operator")
+            self.detection_to_confirm = None
+            self.click_wait_start = None
+            if not self.use_detection(res):
+                # 3D point not available: new detection (and new confirmation), with a new detection_timeout
+                self.state_start = self.get_clock().now()
+            return
+
+        if self.click_confirm_outside_bbox == "use_click":
+            self.get_logger().info(f"[{self.get_name()}] Click outside the detected box: using the clicked "
+                                   f"point as target")
+            # on failure (no depth) it keeps waiting for a click
+            self.use_click(click)
+            return
+
+        self.get_logger().info(f"[{self.get_name()}] Click outside the detected box: detection discarded, "
+                               f"detecting again")
+        self.detection_to_confirm = None
+        self.click_wait_start = None
+        self.state_start = self.get_clock().now()
+
+    def detection_bbox_px(self, res):
+        """Bounding box (x1, y1, x2, y2) of a detection response in pixels."""
+        x1, y1, x2, y2 = res.x1, res.y1, res.x2, res.y2
+        if res.normalized and self.camera_info is not None:
+            w, h = self.camera_info.width, self.camera_info.height
+            x1, y1, x2, y2 = x1 * w, y1 * h, x2 * w, y2 * h
+        return x1, y1, x2, y2
 
     def place_object(self, poses_file):
         """Blocking: moves the arm through place_arm_sequence (poses read from poses_file) with
@@ -737,31 +918,40 @@ class FSMNode(Node):
 
     def locate_ball(self, res):
         """Detection response -> PointStamped of the ball in global_frame, None if data is missing."""
+        if self.camera_info is None:
+            self.get_logger().warn(f"[{self.get_name()}] No camera_info received yet", throttle_duration_sec=2.0)
+            return None
+        x1, y1, x2, y2 = res.x1, res.y1, res.x2, res.y2
+        if res.normalized:
+            x1, x2 = x1 * self.camera_info.width, x2 * self.camera_info.width
+            y1, y2 = y1 * self.camera_info.height, y2 * self.camera_info.height
+        return self.locate_pixel_region(x1, y1, x2, y2, res.frame_id)
+
+    def locate_pixel_region(self, x1, y1, x2, y2, frame_id, shrink=0.5):
+        """Image region in pixels -> PointStamped in global_frame of its center, at the median depth of the
+        central `shrink` part of the region (see bbox_depth). None if data is missing."""
         if self.camera_info is None or self.depth_msg is None:
             self.get_logger().warn(f"[{self.get_name()}] No camera_info/depth received yet", throttle_duration_sec=2.0)
             return None
 
         info = self.camera_info
         fx, fy, cx, cy = info.k[0], info.k[4], info.k[2], info.k[5]
-        x1, y1, x2, y2 = res.x1, res.y1, res.x2, res.y2
-        if res.normalized:
-            x1, x2 = x1 * info.width, x2 * info.width
-            y1, y2 = y1 * info.height, y2 * info.height
 
         depth = self.bridge.imgmsg_to_cv2(self.depth_msg, desired_encoding="passthrough")
         depth_m = depth.astype(np.float32) / 1000.0 if depth.dtype == np.uint16 else depth.astype(np.float32)
-        # depth and color image may have different resolutions: scale the bbox to the depth image
+        # depth and color image may have different resolutions: scale the region to the depth image
         sx, sy = depth_m.shape[1] / info.width, depth_m.shape[0] / info.height
-        z = bbox_depth(depth_m, x1 * sx, y1 * sy, x2 * sx, y2 * sy)
+        z = bbox_depth(depth_m, x1 * sx, y1 * sy, x2 * sx, y2 * sy, shrink=shrink)
         if z is None:
-            self.get_logger().warn(f"[{self.get_name()}] No valid depth inside the bbox")
+            self.get_logger().warn(f"[{self.get_name()}] No valid depth inside the region "
+                                   f"({x1:.0f}, {y1:.0f}, {x2:.0f}, {y2:.0f})")
             return None
 
         u, v = (x1 + x2) / 2.0, (y1 + y2) / 2.0
         px, py, pz = deproject(u, v, z, fx, fy, cx, cy)
 
         point = PointStamped()
-        point.header.frame_id = res.frame_id or info.header.frame_id
+        point.header.frame_id = frame_id or info.header.frame_id
         point.point.x, point.point.y, point.point.z = px, py, pz
         try:
             tf = self.tf_buffer.lookup_transform(self.global_frame, point.header.frame_id, Time(),
