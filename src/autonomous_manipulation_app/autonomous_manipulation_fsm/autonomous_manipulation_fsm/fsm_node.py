@@ -125,7 +125,7 @@ class FSMNode(Node):
         # box on the yolo_detector window before the target is used
         #   click_confirm_navigation: far detection (navigation target)
         #   click_confirm_pick: near detection (pick target)
-        self.declare_parameter("click_confirm_navigation", False)
+        self.declare_parameter("click_confirm_navigation", True)
         self.declare_parameter("click_confirm_pick", False)
         # tolerance (px) around the detected box for the confirmation click
         self.declare_parameter("click_confirm_margin", 20.0)

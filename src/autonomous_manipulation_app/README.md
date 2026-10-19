@@ -107,41 +107,43 @@ cd /home/spot_ws
 colcon build --packages-select detection_service_msg manipulation_interfaces autonomous_manipulation_fsm --symlink-install
 source install/setup.bash
 
+# with the click (default): every detection is confirmed by the operator with a click on the
+# yolo_detector window before the navigation; if YOLO finds nothing, the target can be clicked
 ros2 launch autonomous_manipulation_fsm fsm_launch.py
 
+# without the click: YOLO only, no confirmation (if YOLO finds nothing the FSM goes to ERROR)
+ros2 launch autonomous_manipulation_fsm fsm_launch.py use_click:=false
 
-```
-
-# Click fallback (backup of the YOLO detection)
-If YOLO does not detect the target within `detection_timeout`, DETECT does not go to ERROR: it waits for a
-left click on the detector window (`show_image: true` in `yolo_detector/config/detector_params.yaml`).
-The detector publishes the clicked pixel (`geometry_msgs/PointStamped`, x/y in pixels, header of the shown
-image) on `/clicked_pixel`.
-
-In `autonomous_manipulation_fsm/config/fsm_params.yaml`:
-- `click_fallback_navigation: true`: in the far DETECT the robot walks towards the clicked point
-  (3D from the hand depth, stops `standoff_distance` from it, facing it)
-- `click_fallback_pick: true`: in the near DETECT the clicked pixel is grasped by the Manipulate action
-
-With `false` the FSM goes to ERROR as before. Click only after the warning
-"No ball located in ... s: click the ... on the yolo_detector window": earlier clicks are ignored.
-Without a click for `click_timeout` seconds the FSM goes to ERROR.
-
-# Click confirmation of the detection
-With `click_confirm_navigation: true` (far detection) and/or `click_confirm_pick: true` (near detection),
-after a YOLO detection the FSM logs "Confirm the ... detected in (x1, y1, x2, y2): click inside its box"
-and waits for the operator:
-- click inside the detected box (green TARGET box, + `click_confirm_margin` px): the YOLO target is used
-- click outside the box, depending on `click_confirm_outside_bbox`:
-  - `"use_click"`: the clicked point becomes the target (operator correction)
-  - `"retry"`: the detection is discarded and a new one is done (to be confirmed again)
-
-Without a click for `click_timeout` seconds the FSM goes to ERROR. If YOLO finds nothing, the click
-fallback above still applies.
-```bash
-# test the clicks without the FSM
+# debug: check the clicks published by the detector window (no FSM needed)
 ros2 topic echo /clicked_pixel
 ```
+
+# Click on the detector window
+The click needs the detector window (`show_image: true` in `yolo_detector/config/detector_params.yaml`,
+`DISPLAY=:2` in the yolo container). A left click publishes the pixel (`geometry_msgs/PointStamped`,
+x/y in pixels, header of the shown image) on `/clicked_pixel`. Only clicks made after the FSM asks for them
+are used. Without a click for `click_timeout` seconds the FSM goes to ERROR.
+
+`use_click:=false` sets all the parameters below to false. With `use_click:=true` (default) they are read
+from `autonomous_manipulation_fsm/config/fsm_params.yaml`.
+
+## Confirmation of the detection
+- `click_confirm_navigation: true` (default): after every far detection, before the navigation, the FSM
+  logs "Confirm the ... detected in (x1, y1, x2, y2): click inside its box" and waits for the operator
+- `click_confirm_pick: false` (default): the same for the near detection, before the pick
+
+The operator's click:
+- inside the detected box (green TARGET box, + `click_confirm_margin` px): the YOLO target is used
+- outside the box, depending on `click_confirm_outside_bbox`:
+  - `"use_click"` (default): the clicked point becomes the target (operator correction)
+  - `"retry"`: the detection is discarded and a new one is done (to be confirmed again)
+
+## Fallback (YOLO finds nothing)
+If YOLO does not detect the target within `detection_timeout`, the FSM logs
+"No ball located in ... s: click the ... on the yolo_detector window" instead of going to ERROR:
+- `click_fallback_navigation: true`: the robot walks towards the clicked point (3D from the hand depth,
+  stops `standoff_distance` from it, facing it)
+- `click_fallback_pick: true`: the clicked pixel is grasped by the Manipulate action
 
 # Useful commands
 ```bash

@@ -46,7 +46,7 @@ fsm_node:
     # (green TARGET box) on the yolo_detector window, before the target is used
     #   click_confirm_navigation: far detection (navigation target)
     #   click_confirm_pick:       near detection (pick target)
-    click_confirm_navigation: false
+    click_confirm_navigation: true
     click_confirm_pick: false
     # tolerance (px) around the detected box for the confirmation click
     click_confirm_margin: 20.0
