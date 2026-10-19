@@ -31,6 +31,32 @@ fsm_node:
     # depth registered to the hand color camera (same pixels as the detection)
     depth_topic: "/depth_registered/hand/image"
 
+    # ---------- click fallback ----------
+    # backup of the YOLO detection: if nothing is detected in detection_timeout, DETECT waits for a pixel
+    # clicked (left button) on the yolo_detector window instead of going to ERROR
+    # (needs show_image: true in detector_params.yaml); false = ERROR as before
+    #   click_fallback_navigation: far detection -> the clicked pixel + depth is where the robot walks to
+    #                              (standoff_distance away from it, facing it)
+    #   click_fallback_pick:       near detection -> the clicked pixel is grasped by the Manipulate action
+    click_fallback_navigation: true
+    click_fallback_pick: true
+
+    # ---------- operator OK ----------
+    # before the robot moves (start of the cycle, navigation to the target, pick, place, return home) the
+    # FSM waits for the operator's OK: a left click anywhere on the yolo_detector window (confirm_by_click),
+    # Enter, or the /fsm_node/start service. The window shows what the FSM is waiting for.
+    confirm_by_click: true
+    # OK before the navigation to the detected target (not asked when the target was clicked by the operator)
+    confirm_navigation: true
+    # topic where the FSM publishes the request drawn on the yolo_detector window
+    click_request_topic: "click_request"
+    # topic of the clicked pixel (clicked_pixel_topic in detector_params.yaml)
+    clicked_pixel_topic: "clicked_pixel"
+    # half size (px) of the square around the clicked pixel used to read the depth
+    click_depth_window: 5
+    # seconds to wait for a click (fallback or confirmation) before going to ERROR (0 = wait forever)
+    click_timeout: 120.0
+
     # ---------- navigation ----------
     # distance (m) between robot body and ball at the end of the navigation
     standoff_distance: 0.8

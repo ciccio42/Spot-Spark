@@ -11,6 +11,11 @@ from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.wait_for_message import wait_for_message
 from sensor_msgs.msg import CompressedImage
 from geometry_msgs.msg import PointStamped
+<<<<<<< HEAD
+=======
+from std_msgs.msg import String
+from rclpy.qos import QoSProfile, DurabilityPolicy
+>>>>>>> 1bf5e2586f1b13ad7d75c44d7ada20f636e0069f
 import cv2
 import numpy as np
 from cv_bridge import CvBridge
@@ -40,11 +45,21 @@ class DetectorNode(Node):
         # live cv2 window with the camera image, the detections and the target sent by the service
         self.declare_parameter("show_image", True)
         self.declare_parameter("window_name", "hand camera - detections")
+<<<<<<< HEAD
         # a click is accepted as a confirmation only if a client asked for one in the last
         # confirmation_request_window seconds (the FSM asks continuously while waiting)
         self.declare_parameter("confirmation_request_window", 2.0)
         # pixel the FSM sends to Manipulation, drawn in the "pick target" window
         self.declare_parameter("pick_target_topic", "/fsm_node/pick_target")
+=======
+        # left click on the window publishes the clicked pixel (PointStamped, x/y in pixels, header of the
+        # shown image) on this topic; the FSM uses it as target when the YOLO detection fails (click fallback)
+        self.declare_parameter("clicked_pixel_topic", "clicked_pixel")
+        # seconds the last clicked point stays drawn on the window
+        self.declare_parameter("click_marker_duration", 3.0)
+        # what the FSM is waiting a click for (std_msgs/String, "" = nothing), drawn as a banner on the window
+        self.declare_parameter("click_request_topic", "click_request")
+>>>>>>> 1bf5e2586f1b13ad7d75c44d7ada20f636e0069f
 
         
         self.checkpoint = self.get_parameter("checkpoint").get_parameter_value().string_value
@@ -59,8 +74,13 @@ class DetectorNode(Node):
         self.normalized = self.get_parameter("normalized").get_parameter_value().bool_value
         self.show_image = self.get_parameter("show_image").get_parameter_value().bool_value
         self.window_name = self.get_parameter("window_name").get_parameter_value().string_value
+<<<<<<< HEAD
         self.confirmation_request_window = (
             self.get_parameter("confirmation_request_window").get_parameter_value().double_value)
+=======
+        self.clicked_pixel_topic = self.get_parameter("clicked_pixel_topic").get_parameter_value().string_value
+        self.click_marker_duration = self.get_parameter("click_marker_duration").get_parameter_value().double_value
+>>>>>>> 1bf5e2586f1b13ad7d75c44d7ada20f636e0069f
         
         self.detector = Detector(self.model_path, device=self.device)
         self.get_logger().info(f"[{self.get_name()}] DetectorNode initialized with model: {self.model_path} on device: {self.device}")
@@ -89,6 +109,14 @@ class DetectorNode(Node):
         
         # create a Publisher for the detection results
         self.publisher = self.create_publisher(CompressedImage, f"{self.camera_name}/detections", 1) 
+        # pixel clicked on the cv2 window (published from the display thread)
+        self.click_publisher = self.create_publisher(PointStamped, self.clicked_pixel_topic, 10)
+        # request of the FSM shown on the window; transient local, like the FSM publisher
+        self.click_request = ""
+        self.create_subscription(
+            String, self.get_parameter("click_request_topic").get_parameter_value().string_value,
+            self.click_request_callback, QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL),
+            callback_group=MutuallyExclusiveCallbackGroup())
         
         # best target detection of the last processed frame, None until the first frame is processed;
         # shared between image_callback and the service callback, guarded by a lock
@@ -110,8 +138,16 @@ class DetectorNode(Node):
         # cv2 window: image_callback only stores the frame to show, a dedicated thread owns the window
         # (imshow/waitKey always from the same thread, never blocking the ROS callbacks)
         self.display_frame = None
+<<<<<<< HEAD
         # targets / frame_id / stamp of the frame currently shown in the window (for the mouse clicks)
         self.shown_frame = None
+=======
+        # (frame_id, stamp) of display_frame, and of the frame currently shown: a click refers to the latter
+        self.display_header = None
+        self.shown_header = None
+        # last clicked pixel (u, v) and the time.time() of the click, drawn on the window for a while
+        self.last_click = None
+>>>>>>> 1bf5e2586f1b13ad7d75c44d7ada20f636e0069f
         self.display_lock = threading.Lock()
         # operator confirmation: detection clicked in the window, returned once by the service
         # (guarded by detection_lock); time of the last service call asking for a confirmation
@@ -150,7 +186,11 @@ class DetectorNode(Node):
         results = self.detector.detect(frame)
         if not results:
             self.get_logger().warn(f"[{self.get_name()}] Detector returned no results")
+<<<<<<< HEAD
             self.set_display_frame(frame, [], None, msg.header.frame_id, msg.header.stamp)
+=======
+            self.set_display_frame(frame, None, msg.header.frame_id, msg.header.stamp)
+>>>>>>> 1bf5e2586f1b13ad7d75c44d7ada20f636e0069f
             with self.detection_lock:
                 self.last_detection = None
                 self.frame_processed = True
@@ -192,7 +232,11 @@ class DetectorNode(Node):
             self.last_frame_id = msg.header.frame_id
             self.last_stamp = msg.header.stamp
 
+<<<<<<< HEAD
         self.set_display_frame(r.plot(), targets, best, msg.header.frame_id, msg.header.stamp)
+=======
+        self.set_display_frame(r.plot(), best, msg.header.frame_id, msg.header.stamp)
+>>>>>>> 1bf5e2586f1b13ad7d75c44d7ada20f636e0069f
 
         if not detections:
             self.get_logger().info(f"[{self.get_name()}] No detections above conf {self.conf_threshold:.2f}")
@@ -209,9 +253,14 @@ class DetectorNode(Node):
                 f"bbox=({x1:.0f}, {y1:.0f}, {x2:.0f}, {y2:.0f})")
 
 
+<<<<<<< HEAD
     def set_display_frame(self, image, targets, best, frame_id, stamp):
         """Annotates the image with the target returned by the service and hands it to the window,
         together with the frame data the mouse clicks refer to."""
+=======
+    def set_display_frame(self, image, best, frame_id, stamp):
+        """Annotates the image with the target returned by the service and hands it to the window."""
+>>>>>>> 1bf5e2586f1b13ad7d75c44d7ada20f636e0069f
         if self.display_thread is None:
             return
         view = image.copy()
@@ -243,12 +292,18 @@ class DetectorNode(Node):
             cv2.putText(view, banner, (10, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
 
         with self.display_lock:
+<<<<<<< HEAD
             self.display_frame = (view, {"targets": targets, "frame_id": frame_id, "stamp": stamp, "image": base})
+=======
+            self.display_frame = view
+            self.display_header = (frame_id, stamp)
+>>>>>>> 1bf5e2586f1b13ad7d75c44d7ada20f636e0069f
 
     def display_loop(self):
-        """Owns the cv2 window: shows the latest annotated frame (~30 Hz)."""
+        """Owns the cv2 window: shows the latest annotated frame (~30 Hz) and handles the mouse clicks."""
         try:
             cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
+<<<<<<< HEAD
             # clicks are delivered by waitKey below, i.e. in this thread
             cv2.setMouseCallback(self.window_name, self.on_mouse)
             while not self.display_stop.is_set():
@@ -264,6 +319,35 @@ class DetectorNode(Node):
                     snapshot, sent = self.pick_snapshot, self.sent_target
                 if dirty and snapshot is not None:
                     cv2.imshow(f"{self.window_name} - pick target", self.draw_pick_view(snapshot, sent))
+=======
+            cv2.setMouseCallback(self.window_name, self.mouse_callback)
+            view = None
+            while not self.display_stop.is_set():
+                with self.display_lock:
+                    new_view, self.display_frame = self.display_frame, None
+                    if new_view is not None:
+                        view = new_view
+                        self.shown_header = self.display_header
+                    click = self.last_click
+                request = self.click_request
+                if view is not None:
+                    shown = view
+                    # banner with what the FSM is waiting for: any left click on the window is the OK
+                    if request:
+                        shown = view.copy()
+                        h, w = shown.shape[:2]
+                        cv2.rectangle(shown, (0, h - 70), (w, h - 25), (0, 255, 255), -1)
+                        cv2.putText(shown, f"CLICK = OK: {request}", (10, h - 38),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
+                    # the clicked point is drawn on a copy, so it disappears after click_marker_duration
+                    if click is not None and time() - click[2] < self.click_marker_duration:
+                        shown = shown.copy() if shown is view else shown
+                        cv2.circle(shown, (click[0], click[1]), 12, (255, 0, 255), 2)
+                        cv2.drawMarker(shown, (click[0], click[1]), (255, 0, 255), cv2.MARKER_CROSS, 24, 2)
+                        cv2.putText(shown, f"CLICK ({click[0]}, {click[1]})", (10, 60),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 255), 2)
+                    cv2.imshow(self.window_name, shown)
+>>>>>>> 1bf5e2586f1b13ad7d75c44d7ada20f636e0069f
                 cv2.waitKey(30)
         except cv2.error as e:
             # e.g. opencv-python-headless (no GUI support) or no X server reachable
@@ -274,6 +358,7 @@ class DetectorNode(Node):
             except cv2.error:
                 pass
 
+<<<<<<< HEAD
     def pick_target_callback(self, msg):
         """Pixel the FSM is sending to Manipulation: drawn in the "pick target" window."""
         with self.display_lock:
@@ -388,6 +473,31 @@ class DetectorNode(Node):
         response.confidence = det["conf"]
         response.x1, response.y1, response.x2, response.y2 = x1, y1, x2, y2
         response.center_x, response.center_y = cx, cy
+=======
+    def click_request_callback(self, msg):
+        self.click_request = msg.data
+        if msg.data:
+            self.get_logger().info(f"[{self.get_name()}] FSM waiting for a click: {msg.data}")
+
+    def mouse_callback(self, event, x, y, flags, param):
+        """Left click on the window: publishes the pixel with the header of the image shown at that time
+        (called from the display thread, inside cv2.waitKey)."""
+        if event != cv2.EVENT_LBUTTONDOWN:
+            return
+        with self.display_lock:
+            header = self.shown_header
+            self.last_click = (x, y, time())
+        if header is None:
+            self.get_logger().warn(f"[{self.get_name()}] Click at ({x}, {y}) ignored: no image shown yet")
+            return
+        msg = PointStamped()
+        msg.header.frame_id, msg.header.stamp = header
+        # pixel coordinates of the image (cv2 reports them in image space even if the window is resized)
+        msg.point.x, msg.point.y, msg.point.z = float(x), float(y), 0.0
+        self.click_publisher.publish(msg)
+        self.get_logger().info(f"[{self.get_name()}] Clicked pixel ({x}, {y}) in {msg.header.frame_id}, "
+                               f"published on {self.click_publisher.topic_name}")
+>>>>>>> 1bf5e2586f1b13ad7d75c44d7ada20f636e0069f
 
     @staticmethod
     def normalize_class(name):

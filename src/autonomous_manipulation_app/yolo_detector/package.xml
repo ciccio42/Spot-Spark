@@ -13,6 +13,10 @@
   <exec_depend>ament_index_python</exec_depend>
   <exec_depend>sensor_msgs</exec_depend>
   <exec_depend>geometry_msgs</exec_depend>
+<<<<<<< HEAD
+=======
+  <exec_depend>std_msgs</exec_depend>
+>>>>>>> 1bf5e2586f1b13ad7d75c44d7ada20f636e0069f
   <exec_depend>cv_bridge</exec_depend>
   <exec_depend>detection_service_msg</exec_depend>
 
