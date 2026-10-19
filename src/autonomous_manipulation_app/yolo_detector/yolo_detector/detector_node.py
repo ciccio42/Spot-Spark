@@ -11,6 +11,8 @@ from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.wait_for_message import wait_for_message
 from sensor_msgs.msg import CompressedImage
 from geometry_msgs.msg import PointStamped
+from std_msgs.msg import String
+from rclpy.qos import QoSProfile, DurabilityPolicy
 import cv2
 import numpy as np
 from cv_bridge import CvBridge
@@ -45,6 +47,8 @@ class DetectorNode(Node):
         self.declare_parameter("clicked_pixel_topic", "clicked_pixel")
         # seconds the last clicked point stays drawn on the window
         self.declare_parameter("click_marker_duration", 3.0)
+        # what the FSM is waiting a click for (std_msgs/String, "" = nothing), drawn as a banner on the window
+        self.declare_parameter("click_request_topic", "click_request")
 
         
         self.checkpoint = self.get_parameter("checkpoint").get_parameter_value().string_value
@@ -91,6 +95,12 @@ class DetectorNode(Node):
         self.publisher = self.create_publisher(CompressedImage, f"{self.camera_name}/detections", 1) 
         # pixel clicked on the cv2 window (published from the display thread)
         self.click_publisher = self.create_publisher(PointStamped, self.clicked_pixel_topic, 10)
+        # request of the FSM shown on the window; transient local, like the FSM publisher
+        self.click_request = ""
+        self.create_subscription(
+            String, self.get_parameter("click_request_topic").get_parameter_value().string_value,
+            self.click_request_callback, QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL),
+            callback_group=MutuallyExclusiveCallbackGroup())
         
         # best target detection of the last processed frame, None until the first frame is processed;
         # shared between image_callback and the service callback, guarded by a lock
@@ -236,11 +246,19 @@ class DetectorNode(Node):
                         view = new_view
                         self.shown_header = self.display_header
                     click = self.last_click
+                request = self.click_request
                 if view is not None:
                     shown = view
+                    # banner with what the FSM is waiting for: any left click on the window is the OK
+                    if request:
+                        shown = view.copy()
+                        h, w = shown.shape[:2]
+                        cv2.rectangle(shown, (0, h - 70), (w, h - 25), (0, 255, 255), -1)
+                        cv2.putText(shown, f"CLICK = OK: {request}", (10, h - 38),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
                     # the clicked point is drawn on a copy, so it disappears after click_marker_duration
                     if click is not None and time() - click[2] < self.click_marker_duration:
-                        shown = view.copy()
+                        shown = shown.copy() if shown is view else shown
                         cv2.circle(shown, (click[0], click[1]), 12, (255, 0, 255), 2)
                         cv2.drawMarker(shown, (click[0], click[1]), (255, 0, 255), cv2.MARKER_CROSS, 24, 2)
                         cv2.putText(shown, f"CLICK ({click[0]}, {click[1]})", (10, 60),
@@ -255,6 +273,11 @@ class DetectorNode(Node):
                 cv2.destroyAllWindows()
             except cv2.error:
                 pass
+
+    def click_request_callback(self, msg):
+        self.click_request = msg.data
+        if msg.data:
+            self.get_logger().info(f"[{self.get_name()}] FSM waiting for a click: {msg.data}")
 
     def mouse_callback(self, event, x, y, flags, param):
         """Left click on the window: publishes the pixel with the header of the image shown at that time

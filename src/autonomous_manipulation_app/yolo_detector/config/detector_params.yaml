@@ -14,3 +14,5 @@ detection_node:
     # used by the FSM as backup when the YOLO detection fails (click_fallback_*, needs show_image)
     clicked_pixel_topic: "clicked_pixel"
     click_marker_duration: 3.0     # s the clicked point stays drawn on the window
+    # what the FSM is waiting a click for (drawn as a yellow banner): any left click is the operator's OK
+    click_request_topic: "click_request"

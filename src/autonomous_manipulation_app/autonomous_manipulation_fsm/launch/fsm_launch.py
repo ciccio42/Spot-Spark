@@ -10,9 +10,10 @@ does not forward its stdin), or from another terminal:
 
 Arguments:
   params_file     YAML file with the node parameters (default: the one installed with the package)
-  use_click       true (default): click_* parameters from params_file (by default the operator confirms
-                  every detection with a click on the yolo_detector window before the navigation);
-                  false: no click at all (click_confirm_* and click_fallback_* set to false)
+  use_click       true (default): click parameters from params_file (by default the robot waits for the
+                  operator's OK, a click on the yolo_detector window, before every motion);
+                  false: no click and no OK before the navigation (confirm_by_click, confirm_navigation and
+                  click_fallback_* set to false); the other steps are still confirmed with Enter
   log_level       ROS log level (debug, info, warn, error)
 
 Example:
@@ -27,7 +28,7 @@ from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 # parameters disabled by use_click:=false
-CLICK_PARAMS = ['click_confirm_navigation', 'click_confirm_pick',
+CLICK_PARAMS = ['confirm_by_click', 'confirm_navigation',
                 'click_fallback_navigation', 'click_fallback_pick']
 
 
@@ -63,7 +64,7 @@ def generate_launch_description():
         DeclareLaunchArgument('params_file', default_value=default_params,
                               description='YAML file with the FSM parameters'),
         DeclareLaunchArgument('use_click', default_value='true',
-                              description='false: no click confirmation/fallback on the yolo_detector window'),
+                              description='false: no click (OK and fallback) on the yolo_detector window'),
         DeclareLaunchArgument('log_level', default_value='info', description='ROS log level'),
         OpaqueFunction(function=launch_node),
     ])

@@ -15,6 +15,7 @@ from rclpy.duration import Duration
 from rclpy.signals import SignalHandlerOptions
 from rclpy.executors import MultiThreadedExecutor, SingleThreadedExecutor
 from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.qos import QoSProfile, DurabilityPolicy
 from action_msgs.msg import GoalStatus
 from ament_index_python.packages import get_package_share_directory, PackageNotFoundError
 
@@ -23,6 +24,7 @@ from tf2_geometry_msgs import do_transform_point
 from cv_bridge import CvBridge
 from geometry_msgs.msg import PointStamped, PoseStamped, Twist
 from sensor_msgs.msg import CameraInfo, Image
+from std_msgs.msg import String
 from std_srvs.srv import Trigger
 from nav2_msgs.action import NavigateToPose
 from detection_service_msg.srv import Detection
@@ -121,17 +123,15 @@ class FSMNode(Node):
         #   click_fallback_pick: near detection, the clicked pixel is sent to the Manipulate action
         self.declare_parameter("click_fallback_navigation", True)
         self.declare_parameter("click_fallback_pick", True)
-        # confirmation of the YOLO detection: after a detection the operator must click inside the detected
-        # box on the yolo_detector window before the target is used
-        #   click_confirm_navigation: far detection (navigation target)
-        #   click_confirm_pick: near detection (pick target)
-        self.declare_parameter("click_confirm_navigation", True)
-        self.declare_parameter("click_confirm_pick", False)
-        # tolerance (px) around the detected box for the confirmation click
-        self.declare_parameter("click_confirm_margin", 20.0)
-        # click outside the box: "use_click" = the clicked point becomes the target (operator correction),
-        # "retry" = the detection is discarded and a new one is done
-        self.declare_parameter("click_confirm_outside_bbox", "use_click")
+        # operator's OK before the robot moves (start of the cycle, navigation to the target, pick, place,
+        # return home): with confirm_by_click a left click anywhere on the yolo_detector window gives it,
+        # besides Enter and the ~/start service. The window shows what the FSM is waiting for.
+        self.declare_parameter("confirm_by_click", True)
+        # ask the operator's OK before the navigation to the detected target
+        # (not asked again when the target itself was clicked by the operator, see click_fallback_navigation)
+        self.declare_parameter("confirm_navigation", True)
+        # what the FSM is waiting a click for, drawn on the yolo_detector window ("" = nothing)
+        self.declare_parameter("click_request_topic", "click_request")
         self.declare_parameter("clicked_pixel_topic", "clicked_pixel")
         # half size (px) of the square around the clicked pixel used for the depth (median of valid values)
         self.declare_parameter("click_depth_window", 5)
@@ -175,13 +175,8 @@ class FSMNode(Node):
         self.close_gripper_timeout = float(gp("detection_timeout"))
         self.click_fallback = {"far": bool(gp("click_fallback_navigation")),
                                "near": bool(gp("click_fallback_pick"))}
-        self.click_confirm = {"far": bool(gp("click_confirm_navigation")),
-                              "near": bool(gp("click_confirm_pick"))}
-        self.click_confirm_margin = float(gp("click_confirm_margin"))
-        self.click_confirm_outside_bbox = gp("click_confirm_outside_bbox")
-        if self.click_confirm_outside_bbox not in ("use_click", "retry"):
-            raise ValueError(f"Invalid click_confirm_outside_bbox '{self.click_confirm_outside_bbox}' "
-                             f"(expected 'use_click' or 'retry')")
+        self.confirm_by_click = bool(gp("confirm_by_click"))
+        self.confirm_navigation = bool(gp("confirm_navigation"))
         self.click_depth_window = int(gp("click_depth_window"))
         self.click_timeout = float(gp("click_timeout"))
         # ---------- dependencies ----------
@@ -283,11 +278,17 @@ class FSMNode(Node):
         self.create_subscription(Image, gp("depth_topic"), self.depth_callback, 1)
         # last pixel clicked on the yolo_detector window, consumed by DETECT when YOLO failed
         self.clicked_pixel = None
-        # time DETECT started waiting for a click (YOLO failed or detection to confirm), None otherwise
+        # time DETECT started waiting for a click (YOLO failed), None otherwise
         self.click_wait_start = None
-        # YOLO detection response waiting for the operator's confirmation click, None otherwise
-        self.detection_to_confirm = None
-        self.create_subscription(PointStamped, gp("clicked_pixel_topic"), self.clicked_pixel_callback, 10)
+        # True when the navigation target was clicked by the operator: no further OK is asked
+        self.target_clicked = False
+        # own callback group: the click must be received while the FSM tick is blocked in wait_for_confirmation()
+        self.create_subscription(PointStamped, gp("clicked_pixel_topic"), self.clicked_pixel_callback, 10,
+                                 callback_group=ReentrantCallbackGroup())
+        # transient local: a detector started later still gets the current request
+        self.click_request_pub = self.create_publisher(
+            String, gp("click_request_topic"),
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
 
         # ---------- FSM data ----------
         self.ball_point = None      # PointStamped of the ball in global_frame
@@ -306,7 +307,7 @@ class FSMNode(Node):
         # result of the near detection: {"frame_id", "x_center", "y_center", "stamp"}, None until available
         self.pick_target = None
         self.start_requested = threading.Event()
-        # confirmation (Enter / start service) awaited by wait_for_confirmation() inside a state
+        # confirmation (Enter / start service / click) awaited by wait_for_confirmation() inside a state
         self.confirm_requested = threading.Event()
         self.awaiting_confirmation = False
         self.stdin_thread = None
@@ -333,8 +334,9 @@ class FSMNode(Node):
         self.get_logger().info(f"[{self.get_name()}] FSM started in state {self.fsm.state.name}")
         self.get_logger().info(f"[{self.get_name()}] Click fallback after a failed detection: "
                                f"navigation={self.click_fallback['far']}, pick={self.click_fallback['near']}")
-        self.get_logger().info(f"[{self.get_name()}] Click confirmation of the detection: "
-                               f"navigation={self.click_confirm['far']}, pick={self.click_confirm['near']}")
+        self.get_logger().info(f"[{self.get_name()}] Operator OK: by click={self.confirm_by_click}, "
+                               f"before the navigation={self.confirm_navigation}")
+        self.show_click_request("")
         self.get_logger().info(f"[{self.get_name()}] Nav2 behavior tree: {self.behavior_tree or '<bt_navigator default>'}")
 
     def claim_lease(self, service, timeout):
@@ -396,7 +398,24 @@ class FSMNode(Node):
         self.depth_msg = msg
 
     def clicked_pixel_callback(self, msg):
+        # runs in its own callback group, also while the FSM tick is blocked waiting for the OK
         self.clicked_pixel = msg
+        if not self.confirm_by_click:
+            return
+        # a click is the operator's OK, like Enter: confirms the step waiting in wait_for_confirmation(),
+        # or starts the cycle from IDLE
+        if self.awaiting_confirmation:
+            self.get_logger().info(f"[{self.get_name()}] OK given by click")
+            self.confirm_requested.set()
+        elif self.fsm.state == State.IDLE:
+            self.get_logger().info(f"[{self.get_name()}] Start given by click")
+            self.start_requested.set()
+
+    def show_click_request(self, text):
+        """Shows on the yolo_detector window what the FSM is waiting a click for ("" hides it)."""
+        msg = String()
+        msg.data = text
+        self.click_request_pub.publish(msg)
 
     def wait_for_enter(self):
         # the keyboard is read in a separate thread so the executor is never blocked.
@@ -441,6 +460,8 @@ class FSMNode(Node):
         self.pending = None
         self.state_start = self.get_clock().now()
         self.state_entered = False
+        # a click request (start / fallback) belongs to the state that made it
+        self.show_click_request("")
 
     def step(self):
         try:
@@ -468,6 +489,9 @@ class FSMNode(Node):
             self.get_logger().info(f"[{self.get_name()}] In IDLE state, waiting for a command to start the process.")
             self.start_requested.clear()
             start_service = f"ros2 service call {self.get_fully_qualified_name()}/start std_srvs/srv/Trigger"
+            if self.confirm_by_click:
+                start_service += " or click on the yolo_detector window"
+                self.show_click_request("start the cycle")
             if self.use_stdin:
                 self.get_logger().info(f"[{self.get_name()}] Press Enter to start detection (or: {start_service})")
                 # a single keyboard reader for the whole node, it keeps running across IDLE states
@@ -500,14 +524,8 @@ class FSMNode(Node):
                                    f"detecting objects to pick.")
             pose = self.near_detection_pose if self.detection_mode == "near" else self.far_detection_pose
             self.move_arm_to_detection_pose(pose, open_gripper=True, close_gripper=False)
-            # YOLO first, the click is only the fallback or the confirmation of the detection
+            # YOLO first, the click is only the fallback
             self.click_wait_start = None
-            self.detection_to_confirm = None
-            return
-
-        # YOLO detected the target: waiting for the operator to confirm it with a click
-        if self.detection_to_confirm is not None:
-            self.confirm_detection_with_click()
             return
 
         # YOLO failed: waiting for the target clicked on the yolo_detector window
@@ -551,14 +569,7 @@ class FSMNode(Node):
 
         self.get_logger().info(f"[{self.get_name()}] Detected {res.class_name} conf={res.confidence:.2f} " f"center=({res.center_x:.1f}, {res.center_y:.1f}) frame={res.frame_id}")
 
-        # the operator confirms the detected target with a click before it is used
-        if self.click_confirm[self.detection_mode]:
-            x1, y1, x2, y2 = self.detection_bbox_px(res)
-            self.request_click(f"Confirm the {res.class_name} detected in ({x1:.0f}, {y1:.0f}, {x2:.0f}, "
-                               f"{y2:.0f}): click inside its box on the yolo_detector window")
-            self.detection_to_confirm = res
-            return
-
+        # the operator's OK is asked in NAVIGATE_TO_PICK / PICK, right before the robot moves
         self.use_detection(res)
 
     def use_detection(self, res):
@@ -581,6 +592,7 @@ class FSMNode(Node):
             # depth/intrinsics/TF not available yet: retry with a new detection at the next tick
             return False
         self.ball_point = ball
+        self.target_clicked = False
         self.get_logger().info(f"[{self.get_name()}] Ball in {self.global_frame}: "
                                f"({ball.point.x:.2f}, {ball.point.y:.2f}, {ball.point.z:.2f})")
 
@@ -606,6 +618,8 @@ class FSMNode(Node):
             self.get_logger().warn(f"[{self.get_name()}] Cannot locate the clicked pixel in 3D, click again")
             return False
         self.ball_point = target
+        # the click on the target is already the operator's OK for the navigation
+        self.target_clicked = True
         self.get_logger().info(f"[{self.get_name()}] Clicked target in {self.global_frame}: "
                                f"({target.point.x:.2f}, {target.point.y:.2f}, {target.point.z:.2f})")
         self.fsm.transition(State.NAVIGATE_TO_PICK)
@@ -615,6 +629,8 @@ class FSMNode(Node):
         """Starts waiting for a click on the yolo_detector window: only clicks made from now on are used,
         a pending detection is dropped."""
         self.get_logger().warn(f"[{self.get_name()}] {message}")
+        target = "navigation target" if self.detection_mode == "far" else "object to pick"
+        self.show_click_request(f"no detection: click the {target}")
         self.clicked_pixel = None
         self.pending = None
         self.click_wait_start = self.get_clock().now()
@@ -648,47 +664,6 @@ class FSMNode(Node):
         click = self.next_click()
         if click is not None:
             self.use_click(click)
-
-    def confirm_detection_with_click(self):
-        """DETECT with click_confirm_*: the YOLO detection is used only after the operator clicks inside its
-        box (+ click_confirm_margin). A click outside the box, depending on click_confirm_outside_bbox,
-        makes the clicked point the target ("use_click") or discards the detection ("retry")."""
-        click = self.next_click()
-        if click is None:
-            return
-        res = self.detection_to_confirm
-        u, v = click.point.x, click.point.y
-        x1, y1, x2, y2 = self.detection_bbox_px(res)
-        m = self.click_confirm_margin
-        if x1 - m <= u <= x2 + m and y1 - m <= v <= y2 + m:
-            self.get_logger().info(f"[{self.get_name()}] Detection confirmed by the operator")
-            self.detection_to_confirm = None
-            self.click_wait_start = None
-            if not self.use_detection(res):
-                # 3D point not available: new detection (and new confirmation), with a new detection_timeout
-                self.state_start = self.get_clock().now()
-            return
-
-        if self.click_confirm_outside_bbox == "use_click":
-            self.get_logger().info(f"[{self.get_name()}] Click outside the detected box: using the clicked "
-                                   f"point as target")
-            # on failure (no depth) it keeps waiting for a click
-            self.use_click(click)
-            return
-
-        self.get_logger().info(f"[{self.get_name()}] Click outside the detected box: detection discarded, "
-                               f"detecting again")
-        self.detection_to_confirm = None
-        self.click_wait_start = None
-        self.state_start = self.get_clock().now()
-
-    def detection_bbox_px(self, res):
-        """Bounding box (x1, y1, x2, y2) of a detection response in pixels."""
-        x1, y1, x2, y2 = res.x1, res.y1, res.x2, res.y2
-        if res.normalized and self.camera_info is not None:
-            w, h = self.camera_info.width, self.camera_info.height
-            x1, y1, x2, y2 = x1 * w, y1 * h, x2 * w, y2 * h
-        return x1, y1, x2, y2
 
     def place_object(self, poses_file):
         """Blocking: moves the arm through place_arm_sequence (poses read from poses_file) with
@@ -842,6 +817,10 @@ class FSMNode(Node):
 
         self.get_logger().info(f"[{self.get_name()}] Ball at {d:.2f} m, goal ({gx:.2f}, {gy:.2f}) "
                                f"yaw={np.degrees(yaw):.0f} deg in {self.global_frame}")
+        # operator's OK before walking (the TARGET box is on the yolo_detector window)
+        if self.confirm_navigation and not self.target_clicked:
+            if not self.wait_for_confirmation(f"navigate to the target ({d:.2f} m away)"):
+                return
         status = self.navigate_to(gx, gy, yaw)
 
         # Ask for a new detection to update the pick location
@@ -1005,6 +984,9 @@ class FSMNode(Node):
         """Blocks the FSM tick until Enter is pressed or the start service is called.
         Returns False if the node is shutting down."""
         start_service = f"ros2 service call {self.get_fully_qualified_name()}/start std_srvs/srv/Trigger"
+        if self.confirm_by_click:
+            start_service += " or click on the yolo_detector window"
+            self.show_click_request(action)
         self.confirm_requested.clear()
         self.awaiting_confirmation = True
         if self.use_stdin:
@@ -1021,6 +1003,7 @@ class FSMNode(Node):
             return True
         finally:
             self.awaiting_confirmation = False
+            self.show_click_request("")
 
     def build_pick_goal(self):
         """Manipulate goal from the near detection (self.pick_target)."""

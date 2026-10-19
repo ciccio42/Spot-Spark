@@ -41,18 +41,15 @@ fsm_node:
     click_fallback_navigation: true
     click_fallback_pick: true
 
-    # ---------- click confirmation ----------
-    # after a YOLO detection the operator confirms the target with a click inside the detected box
-    # (green TARGET box) on the yolo_detector window, before the target is used
-    #   click_confirm_navigation: far detection (navigation target)
-    #   click_confirm_pick:       near detection (pick target)
-    click_confirm_navigation: true
-    click_confirm_pick: false
-    # tolerance (px) around the detected box for the confirmation click
-    click_confirm_margin: 20.0
-    # click outside the box: "use_click" = the clicked point becomes the target (operator correction),
-    # "retry" = the detection is discarded and a new one is done
-    click_confirm_outside_bbox: "use_click"
+    # ---------- operator OK ----------
+    # before the robot moves (start of the cycle, navigation to the target, pick, place, return home) the
+    # FSM waits for the operator's OK: a left click anywhere on the yolo_detector window (confirm_by_click),
+    # Enter, or the /fsm_node/start service. The window shows what the FSM is waiting for.
+    confirm_by_click: true
+    # OK before the navigation to the detected target (not asked when the target was clicked by the operator)
+    confirm_navigation: true
+    # topic where the FSM publishes the request drawn on the yolo_detector window
+    click_request_topic: "click_request"
     # topic of the clicked pixel (clicked_pixel_topic in detector_params.yaml)
     clicked_pixel_topic: "clicked_pixel"
     # half size (px) of the square around the clicked pixel used to read the depth
