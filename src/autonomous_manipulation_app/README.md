@@ -133,3 +133,20 @@ cd ${DEMO_PATH}/Spot-Spark/src/autonomous_manipulation_app
 ./kill_switch.sh          # Ctrl+C: stop the robot + kill the app
 ./kill_switch.sh --all    # Ctrl+C: also kill the Spot driver
 ```
+
+# Single launch (everything except the detection)
+Spot container: driver + depth/scan + Nav2 + manipulation_node + FSM. The detection still runs in the yolo container.
+```bash
+# spot container
+cd /home/spot_ws
+colcon build --packages-select detection_service_msg manipulation_interfaces manipulation spot_motion autonomous_manipulation_fsm --symlink-install
+source install/setup.bash
+ros2 launch autonomous_manipulation_fsm app_launch.py                      # driver included
+ros2 launch autonomous_manipulation_fsm app_launch.py launch_driver:=false # driver started separately
+ros2 launch autonomous_manipulation_fsm app_launch.py separate_terminals:=true  # one Tilix window each
+
+# yolo container
+ros2 launch yolo_detector detector_launch.py
+```
+Ctrl+C stops the driver together with the FSM: to let the FSM stow the arm on exit, run the driver
+in its own terminal and use `launch_driver:=false`.

@@ -5,6 +5,7 @@ from time import time
 import rclpy
 from rclpy.node import Node    
 from yolo_detector.detector import Detector
+from yolo_detector.x11_window import set_always_on_top
 from ament_index_python.packages import get_package_share_directory
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
@@ -40,9 +41,13 @@ class DetectorNode(Node):
         # live cv2 window with the camera image, the detections and the target sent by the service
         self.declare_parameter("show_image", True)
         self.declare_parameter("window_name", "hand camera - detections")
+        # keep the cv2 windows (detections and pick target) above the other windows
+        self.declare_parameter("window_always_on_top", True)
         # a click is accepted as a confirmation only if a client asked for one in the last
         # confirmation_request_window seconds (the FSM asks continuously while waiting)
         self.declare_parameter("confirmation_request_window", 2.0)
+        # half size (px) of the bbox built around a manual target click (used for the depth of the point)
+        self.declare_parameter("manual_box_half_size", 10)
         # pixel the FSM sends to Manipulation, drawn in the "pick target" window
         self.declare_parameter("pick_target_topic", "/fsm_node/pick_target")
 
@@ -59,6 +64,8 @@ class DetectorNode(Node):
         self.normalized = self.get_parameter("normalized").get_parameter_value().bool_value
         self.show_image = self.get_parameter("show_image").get_parameter_value().bool_value
         self.window_name = self.get_parameter("window_name").get_parameter_value().string_value
+        self.window_always_on_top = self.get_parameter("window_always_on_top").get_parameter_value().bool_value
+        self.pick_window_name = f"{self.window_name} - pick target"
         self.confirmation_request_window = (
             self.get_parameter("confirmation_request_window").get_parameter_value().double_value)
         
@@ -117,6 +124,8 @@ class DetectorNode(Node):
         # (guarded by detection_lock); time of the last service call asking for a confirmation
         self.confirmed = None
         self.confirmation_requested_at = 0.0
+        # set by the last confirmation request: a click off the detected balls becomes a manual target
+        self.manual_target_allowed = False
         # "pick target" window: frozen image of the last confirmation (bbox center, click) and the pixel
         # the FSM sent to Manipulation; redrawn only when pick_view_dirty is set (guarded by display_lock)
         self.pick_snapshot = None
@@ -235,6 +244,8 @@ class DetectorNode(Node):
             confirmed = self.confirmed is not None
         if confirmed:
             banner, color = "CONFIRMED - robot moving on (right click = cancel)", (255, 255, 0)
+        elif self.confirmation_pending() and self.manual_target_allowed:
+            banner, color = "CLICK ON THE BALL (or anywhere: manual target)", (0, 165, 255)
         elif self.confirmation_pending():
             banner, color = "CLICK ON THE BALL TO CONFIRM", (0, 255, 255)
         else:
@@ -248,7 +259,10 @@ class DetectorNode(Node):
     def display_loop(self):
         """Owns the cv2 window: shows the latest annotated frame (~30 Hz)."""
         try:
-            cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
+            # windows waiting for the always-on-top request: name -> attempts
+            self.topmost_pending = {}
+            self.create_window(self.window_name)
+            pick_window_created = False
             # clicks are delivered by waitKey below, i.e. in this thread
             cv2.setMouseCallback(self.window_name, self.on_mouse)
             while not self.display_stop.is_set():
@@ -263,8 +277,13 @@ class DetectorNode(Node):
                     dirty, self.pick_view_dirty = self.pick_view_dirty, False
                     snapshot, sent = self.pick_snapshot, self.sent_target
                 if dirty and snapshot is not None:
-                    cv2.imshow(f"{self.window_name} - pick target", self.draw_pick_view(snapshot, sent))
+                    if not pick_window_created:
+                        self.create_window(self.pick_window_name)
+                        pick_window_created = True
+                    cv2.imshow(self.pick_window_name, self.draw_pick_view(snapshot, sent))
                 cv2.waitKey(30)
+                if self.topmost_pending:
+                    self.update_always_on_top()
         except cv2.error as e:
             # e.g. opencv-python-headless (no GUI support) or no X server reachable
             self.get_logger().warn(f"[{self.get_name()}] cv2 window not available, image display disabled: {e}")
@@ -273,6 +292,32 @@ class DetectorNode(Node):
                 cv2.destroyAllWindows()
             except cv2.error:
                 pass
+
+    def create_window(self, name):
+        """Creates a resizable cv2 window; with window_always_on_top it is queued to be put above the
+        other windows once shown (see update_always_on_top). Called from the display thread only."""
+        cv2.namedWindow(name, cv2.WINDOW_NORMAL)
+        if self.window_always_on_top:
+            # cv2.WND_PROP_TOPMOST is ignored by the OpenCV Qt backend: ask the window manager instead
+            self.topmost_pending[name] = 0
+
+    def update_always_on_top(self):
+        """Sends the always-on-top request for the windows created recently. The window must be shown
+        (mapped) for the window manager to apply it, so the request is repeated for a few frames."""
+        for name in list(self.topmost_pending):
+            self.topmost_pending[name] += 1
+            attempts = self.topmost_pending[name]
+            try:
+                found = set_always_on_top(name)
+            except OSError as e:
+                self.get_logger().warn(f"[{self.get_name()}] Cannot keep '{name}' always on top: {e}")
+                del self.topmost_pending[name]
+                continue
+            if found and attempts >= 3:
+                del self.topmost_pending[name]
+            elif attempts > 100:
+                self.get_logger().warn(f"[{self.get_name()}] Window '{name}' not found: not kept on top")
+                del self.topmost_pending[name]
 
     def pick_target_callback(self, msg):
         """Pixel the FSM is sending to Manipulation: drawn in the "pick target" window."""
@@ -348,11 +393,15 @@ class DetectorNode(Node):
         # the clicked ball: the most confident target whose bbox contains the click
         hits = [d for d in shown["targets"]
                 if d["bbox"][0] <= x <= d["bbox"][2] and d["bbox"][1] <= y <= d["bbox"][3]]
-        if not hits:
+        if hits:
+            det = max(hits, key=lambda d: d["conf"])
+        elif self.manual_target_allowed:
+            det = self.manual_detection(x, y, shown["image"].shape)
+        else:
             self.get_logger().warn(f"[{self.get_name()}] Click at ({x}, {y}) is not on a detected "
-                                   f"{self.target_class}: click inside its box")
+                                   f"{self.target_class}: click inside its box (manual targets are "
+                                   f"enabled after a few seconds)")
             return
-        det = max(hits, key=lambda d: d["conf"])
         with self.detection_lock:
             self.confirmed = {"det": det, "frame_id": shown["frame_id"], "stamp": shown["stamp"],
                               "click": (float(x), float(y))}
@@ -364,6 +413,22 @@ class DetectorNode(Node):
         cx, cy = det["center"]
         self.get_logger().info(f"[{self.get_name()}] Operator confirmed {det['class']} conf={det['conf']:.2f} "
                                f"center=({cx:.0f}, {cy:.0f}) click=({x}, {y})")
+
+    def manual_detection(self, x, y, shape):
+        """Detection built from an operator click when YOLO did not find the ball: center = click,
+        small square bbox around it (clipped to the image), class "manual", confidence 0."""
+        h, w = shape[:2]
+        r = self.get_parameter("manual_box_half_size").get_parameter_value().integer_value
+        x1, y1, x2, y2 = max(0, x - r), max(0, y - r), min(w - 1, x + r), min(h - 1, y + r)
+        return {
+            "class": "manual",
+            "conf": 0.0,
+            "bbox": (float(x1), float(y1), float(x2), float(y2)),
+            "center": (float(x), float(y)),
+            "size": (float(x2 - x1), float(y2 - y1)),
+            "bbox_n": (x1 / w, y1 / h, x2 / w, y2 / h),
+            "center_n": (x / w, y / h),
+        }
 
     def fill_response(self, response, det, frame_id, stamp, message, click=None):
         """Fills the Detection response with det (None = no ball: success false, values -1) and the
@@ -396,7 +461,7 @@ class DetectorNode(Node):
 
     def detection_callback(self, request, response):
         if request.require_confirmation:
-            return self.confirmed_detection_callback(response)
+            return self.confirmed_detection_callback(request, response)
         # no operator click without confirmation
         response.click_x = response.click_y = -1.0
 
@@ -435,9 +500,10 @@ class DetectorNode(Node):
         self.get_logger().info(f"[{self.get_name()}] Detection service called: success={response.success}, {response.message}")
         return response
 
-    def confirmed_detection_callback(self, response):
+    def confirmed_detection_callback(self, request, response):
         """Service answer when the operator confirmation is required: the clicked detection, once."""
         self.confirmation_requested_at = time()
+        self.manual_target_allowed = request.allow_manual_target
         with self.detection_lock:
             confirmed, self.confirmed = self.confirmed, None
             frame_id, stamp = self.last_frame_id, self.last_stamp

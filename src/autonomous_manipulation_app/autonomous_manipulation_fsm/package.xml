@@ -11,6 +11,10 @@
   <exec_depend>std_srvs</exec_depend>
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>
+  <!-- launch/app_launch.py -->
+  <exec_depend>spot_driver</exec_depend>
+  <exec_depend>spot_motion</exec_depend>
+  <exec_depend>manipulation</exec_depend>
   <exec_depend>detection_service_msg</exec_depend>
   <exec_depend>nav2_msgs</exec_depend>
   <exec_depend>action_msgs</exec_depend>

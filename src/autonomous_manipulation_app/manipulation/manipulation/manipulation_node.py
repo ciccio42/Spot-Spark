@@ -548,6 +548,8 @@ def main(args=None):
     
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
+    # closing the terminal window (Tilix, app_launch.py separate_terminals:=true) sends SIGHUP
+    signal.signal(signal.SIGHUP, signal_handler)
 
     try:
         while rclpy.ok() and not shutdown_requested:

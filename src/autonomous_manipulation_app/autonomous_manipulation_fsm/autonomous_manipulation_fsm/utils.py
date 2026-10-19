@@ -30,6 +30,19 @@ def bbox_depth(depth_m, x1, y1, x2, y2, shrink=0.5):
     return float(np.median(valid))
 
 
+def depth_around(depth_m, u, v, radius):
+    """Median of the valid depth values (meters) in the square of half size radius (depth pixels)
+    centered on (u, v), and the number of valid pixels; (None, 0) if there are none."""
+    h, w = depth_m.shape[:2]
+    u0, u1 = int(max(0, u - radius)), int(min(w, u + radius + 1))
+    v0, v1 = int(max(0, v - radius)), int(min(h, v + radius + 1))
+    roi = depth_m[v0:v1, u0:u1]
+    valid = roi[np.isfinite(roi) & (roi > 0.0)]
+    if valid.size == 0:
+        return None, 0
+    return float(np.median(valid)), int(valid.size)
+
+
 def deproject(u, v, depth, fx, fy, cx, cy):
     """Pixel (u, v) + depth (m) -> 3D point in the camera optical frame (x right, y down, z forward)."""
     return ((u - cx) * depth / fx, (v - cy) * depth / fy, depth)

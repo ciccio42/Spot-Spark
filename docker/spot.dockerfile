@@ -32,6 +32,18 @@ RUN apt update && apt install -y \
     ros-${ROS_DISTRO}-pointcloud-to-laserscan \
     && rm -rf /var/lib/apt/lists/*
 
+# Tilix: one window split in panes, one per component, with
+#   ros2 launch autonomous_manipulation_fsm app_launch.py separate_terminals:=true
+# dbus-x11 provides dbus-launch (Tilix needs a D-Bus session bus); a font for the terminal;
+# Tilix (VTE) refuses to start without a UTF-8 locale
+RUN apt update && apt install -y \
+    tilix \
+    dbus-x11 \
+    fonts-dejavu-core \
+    && rm -rf /var/lib/apt/lists/*
+ENV LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8
+
 RUN mkdir -p /home/spot_ws/src
 WORKDIR /home/spot_ws/src
 RUN git clone https://github.com/ciccio42/spot_ros2.git

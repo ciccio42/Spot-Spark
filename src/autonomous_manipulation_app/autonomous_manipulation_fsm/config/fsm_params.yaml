@@ -46,6 +46,12 @@ fsm_node:
     confirmation_timeout: 120.0
     # near detection: pick at the pixel clicked by the operator instead of the bbox center
     pick_at_click_point: true
+    # after these seconds (arm in detection pose) a click anywhere is a manual target; negative = never
+    manual_target_after: 5.0
+    # no depth inside the bbox: search around the target center (disabled by default)
+    # in growing squares up to depth_search_max_radius (color px)
+    depth_search_around: false
+    depth_search_max_radius: 60.0
     # pixel sent to Manipulation, shown by yolo_detector in its "pick target" window
     pick_target_topic: "/fsm_node/pick_target"
     navigation_timeout: 60.0
@@ -111,6 +117,8 @@ fsm_node:
     # spot_driver claim service called in the constructor (needed with auto_claim: False in spot.yaml)
     claim_service: "claim"
     claim_timeout: 10.0
+    # at startup the claim is retried for up to this time (s): the driver may not be ready yet
+    claim_retry_time: 30.0
     # claim the lease again before every arm move and every navigation
     claim_before_motion: true
 

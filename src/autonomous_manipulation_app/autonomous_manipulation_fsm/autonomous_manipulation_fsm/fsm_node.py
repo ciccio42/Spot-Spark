@@ -29,7 +29,7 @@ from detection_service_msg.srv import Detection
 
 # dependencies: yolo-detection service, navigation service, manipulation
 from autonomous_manipulation_fsm.fsm import FSM, State
-from autonomous_manipulation_fsm.utils import bbox_depth, deproject, standoff_goal, quat_from_yaw
+from autonomous_manipulation_fsm.utils import bbox_depth, depth_around, deproject, standoff_goal, quat_from_yaw
 from manipulation_interfaces.action import Manipulate, MoveArmToPose
 
 class FSMNode(Node):
@@ -103,6 +103,13 @@ class FSMNode(Node):
         self.declare_parameter("confirmation_timeout", 120.0)
         # near detection: the pick goal uses the pixel clicked by the operator instead of the bbox center
         self.declare_parameter("pick_at_click_point", True)
+        # seconds (from the arm in detection pose) after which a click anywhere on the image is accepted
+        # as a manual target, also when YOLO finds no ball; negative = never
+        self.declare_parameter("manual_target_after", 5.0)
+        # no valid depth inside the bbox (e.g. small manual target box, holes in the hand depth):
+        # search around the target center in growing squares up to depth_search_max_radius (color image px)
+        self.declare_parameter("depth_search_around", False)
+        self.declare_parameter("depth_search_max_radius", 60.0)
         # pixel sent to Manipulation (x, y in pixels, header = frame_id and stamp of the image),
         # shown by yolo_detector in its "pick target" window
         self.declare_parameter("pick_target_topic", "/fsm_node/pick_target")
@@ -117,6 +124,9 @@ class FSMNode(Node):
         # spot_driver lease claim at startup (needed with auto_claim: False in spot.yaml)
         self.declare_parameter("claim_service", "claim")
         self.declare_parameter("claim_timeout", 10.0)
+        # at startup the driver may refuse the claim for a few seconds (e.g. "'NoneType' object is not
+        # iterable": its lease list is not received yet): the claim is retried for up to this time (s)
+        self.declare_parameter("claim_retry_time", 30.0)
         # claim the lease again before every arm move (MoveArmToPose) and every navigation
         self.declare_parameter("claim_before_motion", True)
         # Trigger service called before every navigation to stow the arm (walking with the arm out is unsafe:
@@ -136,6 +146,10 @@ class FSMNode(Node):
         self.require_operator_confirmation = bool(gp("require_operator_confirmation"))
         self.confirmation_timeout = float(gp("confirmation_timeout"))
         self.pick_at_click_point = bool(gp("pick_at_click_point"))
+        self.manual_target_after = float(gp("manual_target_after"))
+        self.depth_search_around = bool(gp("depth_search_around"))
+        self.depth_search_max_radius = float(gp("depth_search_max_radius"))
+        self.manual_target_announced = False
         self.navigation_timeout = float(gp("navigation_timeout"))
         self.behavior_tree = gp("behavior_tree") or self.default_behavior_tree()
         self.use_stdin = bool(gp("use_stdin"))
@@ -167,7 +181,7 @@ class FSMNode(Node):
         self.close_gripper_timeout = float(gp("detection_timeout"))
         # ---------- dependencies ----------
         # take the robot lease before anything else: every arm / gripper / posture command needs it
-        self.claim_lease(gp("claim_service"), float(gp("claim_timeout")))
+        self.claim_lease(gp("claim_service"), float(gp("claim_timeout")), float(gp("claim_retry_time")))
         # same service, called from the FSM tick before each motion: own callback group (blocking call)
         self.claim_service = gp("claim_service")
         self.claim_timeout = float(gp("claim_timeout"))
@@ -307,8 +321,10 @@ class FSMNode(Node):
         self.get_logger().info(f"[{self.get_name()}] FSM started in state {self.fsm.state.name}")
         self.get_logger().info(f"[{self.get_name()}] Nav2 behavior tree: {self.behavior_tree or '<bt_navigator default>'}")
 
-    def claim_lease(self, service, timeout):
-        """Blocking, in the constructor: calls the spot_driver claim service (std_srvs/Trigger).
+    def claim_lease(self, service, timeout, retry_time=0.0):
+        """Blocking, in the constructor: calls the spot_driver claim service (std_srvs/Trigger), retrying
+        every 2 s for up to retry_time when the driver refuses it (the driver may not be ready right after
+        its own start, e.g. when launched together with the FSM).
         Raises RuntimeError if the lease cannot be taken (e.g. held by the tablet).
         The executor is not spinning yet: the call goes through a temporary node with its own
         executor, so the FSM node is never attached to a second executor."""
@@ -320,13 +336,19 @@ class FSMNode(Node):
             self.get_logger().info(f"[{self.get_name()}] Waiting for the '{service}' service...")
             while not client.wait_for_service(timeout_sec=1.0):
                 self.get_logger().info(f"[{self.get_name()}] Waiting for the '{service}' service...")
-            future = client.call_async(Trigger.Request())
-            executor.spin_until_future_complete(future, timeout_sec=timeout)
-            if not future.done():
-                raise RuntimeError(f"'{service}' did not answer in {timeout:.0f} s")
-            res = future.result()
-            if not res.success:
-                raise RuntimeError(f"Cannot claim the lease: {res.message}")
+            deadline = time.monotonic() + retry_time
+            while True:
+                future = client.call_async(Trigger.Request())
+                executor.spin_until_future_complete(future, timeout_sec=timeout)
+                if not future.done():
+                    raise RuntimeError(f"'{service}' did not answer in {timeout:.0f} s")
+                res = future.result()
+                if res.success:
+                    break
+                if time.monotonic() > deadline:
+                    raise RuntimeError(f"Cannot claim the lease: {res.message}")
+                self.get_logger().warn(f"[{self.get_name()}] Claim refused ({res.message}), retrying in 2 s...")
+                time.sleep(2.0)
             self.get_logger().info(f"[{self.get_name()}] Lease claimed: {res.message}")
         finally:
             executor.remove_node(node)
@@ -467,6 +489,7 @@ class FSMNode(Node):
                                    f"detecting objects to pick.")
             pose = self.near_detection_pose if self.detection_mode == "near" else self.far_detection_pose
             self.move_arm_to_detection_pose(pose, open_gripper=True, close_gripper=False)
+            self.manual_target_announced = False
             if self.require_operator_confirmation and self.fsm.state == State.DETECT:
                 self.get_logger().info(f"[{self.get_name()}] Waiting for the operator: click on the ball in the "
                                        f"detector window to confirm it (the robot does not move until then)")
@@ -489,6 +512,13 @@ class FSMNode(Node):
             request = Detection.Request()
             # with the confirmation the detector answers success only after the operator click
             request.require_confirmation = self.require_operator_confirmation
+            # after manual_target_after seconds a click anywhere becomes the target (no detection needed)
+            request.allow_manual_target = (self.require_operator_confirmation and self.manual_target_after >= 0.0
+                                           and self.time_in_state() >= self.manual_target_after)
+            if request.allow_manual_target and not self.manual_target_announced:
+                self.manual_target_announced = True
+                self.get_logger().info(f"[{self.get_name()}] Manual target enabled: click anywhere on the "
+                                       f"detector image to set the target, also without detections")
             self.pending = self.detection_client.call_async(request)
             return
         if not self.pending.done():
@@ -780,11 +810,26 @@ class FSMNode(Node):
         # depth and color image may have different resolutions: scale the bbox to the depth image
         sx, sy = depth_m.shape[1] / info.width, depth_m.shape[0] / info.height
         z = bbox_depth(depth_m, x1 * sx, y1 * sy, x2 * sx, y2 * sy)
-        if z is None:
-            self.get_logger().warn(f"[{self.get_name()}] No valid depth inside the bbox")
-            return None
-
         u, v = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+        if z is None and self.depth_search_around:
+            # holes in the hand depth: look around the center in growing squares (color image px)
+            radius = 10.0
+            while z is None and radius <= self.depth_search_max_radius:
+                z, n = depth_around(depth_m, u * sx, v * sy, radius * max(sx, sy))
+                if z is not None:
+                    self.get_logger().info(f"[{self.get_name()}] No depth inside the bbox, using {n} depth "
+                                           f"pixels within {radius:.0f} px of ({u:.0f}, {v:.0f}): {z:.2f} m")
+                radius *= 2.0
+        if z is None:
+            valid = np.isfinite(depth_m) & (depth_m > 0.0)
+            where = (f"within {self.depth_search_max_radius:.0f} px of" if self.depth_search_around
+                     else "inside the bbox around")
+            self.get_logger().warn(
+                f"[{self.get_name()}] No valid depth {where} "
+                f"({u:.0f}, {v:.0f}): the hand depth has no data there (too far, or a reflective/dark "
+                f"surface). Valid depth pixels in the whole image: {100.0 * valid.mean():.0f}%"
+                + (f", range {depth_m[valid].min():.2f}-{depth_m[valid].max():.2f} m" if valid.any() else ""))
+            return None
         px, py, pz = deproject(u, v, z, fx, fy, cx, cy)
 
         point = PointStamped()
@@ -1081,7 +1126,7 @@ _stopping = False
 
 
 def _on_stop_signal(signum, frame):
-    # first SIGINT/SIGTERM interrupts spin(); the following ones are ignored so they cannot interrupt
+    # first SIGINT/SIGTERM/SIGHUP interrupts spin(); the following ones are ignored so they cannot interrupt
     # the shutdown (ros2 launch forwards a second SIGINT after Ctrl+C, then SIGTERM after sigterm_timeout)
     global _stopping
     if _stopping:
@@ -1095,6 +1140,8 @@ def main(args=None):
     rclpy.init(args=args, signal_handler_options=SignalHandlerOptions.NO)
     signal.signal(signal.SIGINT, _on_stop_signal)
     signal.signal(signal.SIGTERM, _on_stop_signal)
+    # closing the terminal window (e.g. Tilix of app_launch.py separate_terminals:=true) sends SIGHUP
+    signal.signal(signal.SIGHUP, _on_stop_signal)
 
     # multi-threaded: blocking calls inside the FSM (send_goal) get their responses from another thread
     executor = MultiThreadedExecutor()
@@ -1120,8 +1167,12 @@ def main(args=None):
         # an FSM thread may still be blocked in a call that does not watch for shutdown (send_goal of
         # the arm/pick, gripper .call()): Python would wait for it before exiting, and ros2 launch would
         # kill the node only after sigterm_timeout + sigkill_timeout. The cleanup is done: exit now.
-        sys.stdout.flush()
-        sys.stderr.flush()
+        # the terminal may already be gone (Tilix window closed): writing to it fails
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.flush()
+            except (OSError, ValueError):
+                pass
         os._exit(exit_code)
 
 

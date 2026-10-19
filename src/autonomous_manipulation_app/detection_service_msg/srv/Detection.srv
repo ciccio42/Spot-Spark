@@ -5,6 +5,10 @@
 # the detector cv2 window. Until then success is false ("waiting for operator confirmation"); after
 # the click the clicked detection is returned ONCE (the confirmation is consumed).
 bool require_confirmation
+# with require_confirmation: a click ANYWHERE on the image (not on a detected ball, or with no detection
+# at all) becomes a manual target: class_name "manual", confidence 0, a small bbox around the click,
+# center = click
+bool allow_manual_target
 ---
 bool success
 string message
