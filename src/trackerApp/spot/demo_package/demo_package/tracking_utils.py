@@ -41,6 +41,15 @@ METRICS_DIR = '/home/spot_ws/src/codice_carmine/metriche'
 METRICS_SAVE_PERIOD_SEC = 5.0
 SAVE_GALLERY_IMAGES = True        # metriche/gallery_<session>/: one image per view added + current strip
 KF_TOPIC = '/person_follow/target_kf'   # PointStamped (x=u px, y=v px, z=depth m) of the target Kalman
+TARGET_STATE_TOPIC = '/person_follow/target_state'   # nav_msgs/Odometry: target filter in GLOBAL_FRAME
+                                                     # (position, velocity, covariances), every call in
+                                                     # TRACKING / RECOVERY; child_frame_id says whether
+                                                     # it is target/measured, target/predicted or target/frozen
+TARGET_PATH_TOPIC = '/person_follow/target_path'     # nav_msgs/Path: the future trajectory of the target
+                                                     # (GLOBAL_FRAME, one pose every KF_FUTURE_STEP_SEC
+                                                     # with its ABSOLUTE time): what nav2_bridge follows
+GLOBAL_FRAME = 'odom'             # frame of the odom filter: the same as nav2_bridge and Nav2
+TF_TIMEOUT_SEC = 0.03             # waiting for the TF at the time of the image, then the latest one
 
 # LEDs: for each state the NAME of an A/V behavior already on the robot (list_spot_led_behaviors.py)
 STATI_LED = {
@@ -176,31 +185,54 @@ class DebugCanvas:
         cv2.circle(self.frame, c, 4, CYAN, -1)
         cv2.circle(self.frame, c, max(6, int(2.0 * std)), CYAN, 1)
 
-    def kalman(self, tracker, res):
-        """Target Kalman, nothing else:
-             scia ciano      where the target has been (estimate of the last KF_TRAIL_LEN calls;
-                             filled = seen, ring = only predicted)
+    def kalman(self, tracker, res, now=None):
+        """Target predictive filter, nothing else:
+             scia ciano      where the target has been (estimate of the last KF_TRAIL_LEN calls, seen
+                             from the CURRENT camera; filled = seen, ring = only predicted)
              pallino ciano   where it is now
-             freccia magenta where the Kalman expects it in KF_FUTURE_SEC (current velocity)"""
+             punti magenta   the future trajectory still ahead (the SAME points nav2_bridge follows:
+                             straight, or along the curve), one every KF_FUTURE_STEP_SEC, labelled at
+                             +1 s, +2 s, +3 s from now. No uncertainty circles (misleading).
+                             FROZEN prediction (end of the trajectory reached): one grey dot"""
         tgt = tracker.target
         if self.frame is None or tgt is None or not tracker.trail:
             return
-        MAG = (255, 0, 255)
-        pts = list(tracker.trail)
-        xy = [(int(p[0]), int(p[1])) for p in pts]
-        for a, b in zip(xy, xy[1:]):
+        MAG, GREY = (255, 0, 255), (160, 160, 160)
+        h, w = self.frame.shape[:2]
+        pts = [(tgt.kf.project(p[0]), p[1]) for p in tracker.trail]
+        xy = [((int(q[0]), int(q[1])), seen) for q, seen in pts if q is not None]
+        for (a, _), (b, _) in zip(xy, xy[1:]):
             cv2.line(self.frame, a, b, CYAN, 2, cv2.LINE_AA)
-        for (u, v), p in zip(xy[:-1], pts[:-1]):
-            cv2.circle(self.frame, (u, v), 3, CYAN, -1 if p[2] else 1, cv2.LINE_AA)
-        now = xy[-1]
-        cv2.circle(self.frame, now, 6, CYAN, -1, cv2.LINE_AA)
-        fu = tgt.kf.x[0] + tgt.kf.x[3] * emb.KF_FUTURE_SEC
-        fv = tgt.kf.x[1] + tgt.kf.x[4] * emb.KF_FUTURE_SEC
-        fut = (int(fu), int(fv))
-        if abs(fut[0] - now[0]) + abs(fut[1] - now[1]) >= 4:
-            cv2.arrowedLine(self.frame, now, fut, MAG, 2, cv2.LINE_AA, tipLength=0.25)
-        cv2.circle(self.frame, fut, 5, MAG, 2, cv2.LINE_AA)
-        cv2.putText(self.frame, f"+{emb.KF_FUTURE_SEC:g}s", (fut[0] + 7, fut[1] - 7), _FONT, 0.45, MAG, 1, cv2.LINE_AA)
+        for c, seen in xy[:-1]:
+            cv2.circle(self.frame, c, 3, CYAN, -1 if seen else 1, cv2.LINE_AA)
+        cur = tgt.kf.center
+        if abs(cur[0]) > 1e5:
+            return                                   # the target is behind the camera
+        cur = (int(cur[0]), int(cur[1]))
+        cv2.circle(self.frame, cur, 6, CYAN, -1, cv2.LINE_AA)
+        if getattr(tgt.kf, "frozen", False):
+            cv2.circle(self.frame, cur, 9, GREY, 2, cv2.LINE_AA)
+            cv2.putText(self.frame, "previsione ferma", (cur[0] + 10, cur[1] + 18), _FONT, 0.45, GREY, 1, cv2.LINE_AA)
+            return
+        traj = tgt.kf.trajectory()
+        if traj:
+            t_now = tgt.kf.t if now is None else now
+            future = [(t - t_now, tgt.kf.project((x, y, z))) for t, x, y, z in traj if t > t_now + 1e-6]
+        else:                                        # "image" filter: straight extrapolation
+            hz = [emb.KF_FUTURE_STEP_SEC * k for k in range(1, emb.KF_FUTURE_STEPS + 1)]
+            future = [(hh, (u, v)) for hh, (u, v, _) in zip(hz, tgt.kf.predicted_points(hz))]
+        prev, step = cur, emb.KF_FUTURE_STEP_SEC
+        for dt, q in future:
+            if q is None:
+                break
+            c = (int(q[0]), int(q[1]))
+            if not (-w <= c[0] <= 2 * w and -h <= c[1] <= 2 * h):
+                break
+            cv2.line(self.frame, prev, c, MAG, 1, cv2.LINE_AA)
+            cv2.circle(self.frame, c, 3, MAG, -1, cv2.LINE_AA)
+            if round(dt) >= 1 and abs(dt - round(dt)) < step / 2:
+                cv2.putText(self.frame, f"+{round(dt)}s", (c[0] + 6, c[1] - 6), _FONT, 0.45, MAG, 1, cv2.LINE_AA)
+            prev = c
 
     def crop(self, crop_rect):
         if self.frame is not None and crop_rect is not None:
@@ -231,7 +263,7 @@ def draw_tracking(frame, header, dets, res, tracker, extra_line, now):
         word = (f"SOLO POSIZIONE, {why}", YELLOW)
     cv.panel([f"{header} | viste {len(tracker.gallery)}", (f"target {word[0]}  {extra_line}", word[1])])
     if DEBUG_SHOW_KF:
-        cv.kalman(tracker, res)
+        cv.kalman(tracker, res, now)
     for d in dets:
         if d is res.det and res.seen:
             kf_d = tracker.target.kf.depth
@@ -247,15 +279,16 @@ def draw_tracking(frame, header, dets, res, tracker, extra_line, now):
             cv.box(d.box, RED, f"{_dist_text(d)} sim {d.sim_target:.2f}{why}", 2)
 
 
-def draw_search(frame, header, dets, candidate, stability):
-    """SEARCH: one box per detection; the candidate (if exactly one in range) shows its stability."""
+def draw_search(frame, header, dets, candidate, stability, note=None):
+    """SEARCH: one box per detection; the candidate (if exactly one in range) shows its stability.
+    note: extra line (profile of the target, missed frames tolerated)."""
     if frame is None:
         return
     cv = DebugCanvas(frame)
     n_valid = 1 if candidate is not None else sum(1 for d in dets if d.dist is not None)
     second = (f"aggancio {stability}/{emb.STABILITY_FRAMES_REQUIRED}", GREEN) if candidate is not None \
         else (f"persone nel range: {n_valid} (serve esattamente 1)", ORANGE)
-    cv.panel([header, second])
+    cv.panel([header, second] + ([note] if note else []))
     for d in dets:
         if d is candidate:
             cv.box(d.box, GREEN, f"candidato {_dist_text(d)} {stability}/{emb.STABILITY_FRAMES_REQUIRED}", 3)

@@ -32,6 +32,7 @@ import math
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Optional
 
 import numpy as np
@@ -45,8 +46,8 @@ from demo_package.common import (
 # PARAMETERS — the similarities are on the scale of the weighted ReID similarity: when the weights
 # change, recalibrate them from "sim_stats" in the metrics JSON (target / other people distributions).
 # ======================================================================
-W_COSINE = 0.3                   # ReID similarity = weighted mean of cosine, Euclidean and magnitude terms
-W_EUCLIDEAN = 0.7
+W_COSINE = 0.9                   # ReID similarity = weighted mean of cosine, Euclidean and magnitude terms
+W_EUCLIDEAN = 0.1
 W_MAGNITUDE = 0.0
 EUCLIDEAN_SCALE = 10.0
 MAGNITUDE_SCALE = 10.0
@@ -65,10 +66,10 @@ SEARCH_STABILITY_MIN_COS = 0.60  # SEARCH: plain cosine between consecutive fram
 # pose seconds later vs the gallery 0.52-0.60; side 0.47-0.69; back / behind the jacket 0.39-0.50;
 # Pepper (not a person) 0.31-0.36; ANOTHER PERSON: not measured yet -> recalibrate with
 # "sim_stats" of the metrics JSON of a session with a second person.
-TARGET_HIGH = 0.60               # target CONFIRMED
-TARGET_LOW = 0.45                # target KEPT (uncertain) between LOW and HIGH
-GALLERY_VETO_MIN = 0.43# never the target below this similarity to the gallery (None = off)
-FF_MAX_LEAD = 0.15               # sim_target = max(gallery, min(last embedding, gallery + this)): the short-term
+TARGET_HIGH = 0.76               # target CONFIRMED
+TARGET_LOW = 0.64                # target KEPT (uncertain) between LOW and HIGH
+GALLERY_VETO_MIN = 0.30          # never the target below this similarity to the gallery (None = off)
+FF_MAX_LEAD = 0.20               # sim_target = max(gallery, min(last embedding, gallery + this)): the short-term
                                  # memory can lift a detection only this much above the long-term one. If an
                                  # impostor was followed for a while, the last embedding IS the impostor: without
                                  # this cap it would always beat the real target (seen on the robot, 13/10)
@@ -82,7 +83,7 @@ OTHER_CONTINUITY_MAX = 1.0       # a detection CONTINUES a person of the previou
                                  # this) and not clearly more similar to the target: while it walks over the target
                                  # its crop is mixed (part of the target inside) and the appearance alone is fooled
 GALLERY_TIEBREAK = 0.06         # tie on sim_target: the one clearly more similar to the GALLERY wins, then the position
-AMBIGUITY_MARGIN = 0.08          # appearance decides; two candidates closer than this in sim_target are a tie:
+AMBIGUITY_MARGIN = 0.1          # appearance decides; two candidates closer than this in sim_target are a tie:
                                  # the one near the Kalman prediction wins, otherwise nobody is taken
 CLEAN_MARGIN = 0.5               # clean frame: no other box touches the target box widened by this (x width)
 
@@ -123,8 +124,8 @@ OCCLUSION_MAX_SIZE_RATIO = 1.15  # box height vs expected height at the predicte
 DEPTH_RESYNC_FRAMES = 3
 DEPTH_RESYNC_MAX_SPREAD_M = 0.3
 
-REACQ_THRESHOLD = 0.50           # re-acquisition (was 0.60: you, frontal in RECOVERY, stayed at 0.52-0.58)
-REACQ_IMMEDIATE_SIM = 0.55       # between REACQ_THRESHOLD and this: REACQ_CONFIRM_FRAMES calls in the same place
+REACQ_THRESHOLD = 0.71           # re-acquisition (was 0.60: you, frontal in RECOVERY, stayed at 0.52-0.58)
+REACQ_IMMEDIATE_SIM = 0.75       # between REACQ_THRESHOLD and this: REACQ_CONFIRM_FRAMES calls in the same place
 REACQ_CONFIRM_FRAMES = 2
 REACQ_PX_TOLERANCE = 60.0
 REACQ_MAX_GAP = 2
@@ -139,12 +140,66 @@ REACQ_DEPTH_SPEED_MPS = 0.8      #   since it was last seen (a walking person mo
 # from 'person' 0.4 + 'humanoid robot' 0.6 is a robot, not a person).
 CLASS_GROUPS = (("person",),
                 ("quadruped", "quadruped animal", "quadruped robot", "robotic dog", "four-legged robot", "dog"),
-                ("robot", "humanoid robot"))
+                ("humanoid robot",))
+PERSON_GROUP, QUADRUPED_GROUP, HUMANOID_GROUP = 0, 1, 2
+# GENERIC labels: YOLOE calls both a quadruped (Spot) and a humanoid simply "robot" in some frames. Such a
+# label is COMPATIBLE with both robot groups (never with a person), so that a target is not lost when
+# its label switches between "quadruped robot" and "robot" (or "humanoid robot" and "robot").
+GENERIC_ROBOT_CLASSES = ("robot",)
+CLASS_VOTE = True                # the target group is decided by MAJORITY over the SEARCH stability
+                                 # frames (False: from the last frame only, as before)
+
+# TARGET PROFILES. OSNet is trained on people: on a QUADRUPED it gives less stable embeddings (lower
+# similarities, frame to frame and with the gallery). The quadruped profile has its own, lower
+# thresholds and more tolerance; it is used ONLY when the target is a quadruped. Persons and
+# humanoids use the standard values above, unchanged.
+QUADRUPED_PROFILE_ENABLED = True
+QUADRUPED = dict(                # PROVISIONAL values: to be calibrated on a session with the quadruped
+    SEARCH_STABILITY_MIN_COS=0.45,   # (sim_stats of the metrics JSON, cosine between frames in SEARCH)
+    SEARCH_MAX_MISSED_FRAMES=1,      # SEARCH: frames with no detection that do not restart the count
+    TARGET_HIGH=0.50,
+    TARGET_LOW=0.38,
+    REACQ_THRESHOLD=0.44,
+    REACQ_IMMEDIATE_SIM=0.54,
+    GALLERY_VETO_MIN=0.22,
+    GALLERY_STRONG_ADD_MIN_SIM=0.60,
+    INTRUDER_RELEASE_SIM=0.54,
+    TRACKING_GRACE_FRAMES=45,        # ~15 s at 3 Hz: YOLOE misses a quadruped more often
+)
 
 TRACKING_GRACE_FRAMES = 30       # TRACKING -> RECOVERY after this many calls without the target
 RECOVERY_TIMEOUT_SEC = 15.0      # RECOVERY -> WAITING_TRIGGER
 
-KF_ACCEL_PX = 40000.0            # Kalman: white-noise acceleration, image (px^2/s^3) and depth (m^2/s^3)
+# PREDICTIVE FILTER of the target. "odom": position and velocity in the odom frame (3D), the
+# measurement (u, v, d) is the box centre and depth seen through the camera pose at the time of the
+# image (TF): a person standing still stays still while Spot rotates or walks, so the prediction in
+# the image is compensated for the robot motion. "image": the previous filter, in pixels (KalmanUVD).
+PREDICTIVE_FILTER = "odom"
+KF3_ACCEL_XY = 0.5               # odom filter: white-noise acceleration, horizontal (m^2/s^3) and height
+KF3_ACCEL_Z = 0.1
+KF3_MEAS_STD_V_PX = 20.0         # vertical centre of the box: noisier than u (legs/head cut by the crop)
+KF3_INIT_VEL_STD_XY = 1.5        # m/s, velocity unknown when the filter (re)starts
+KF3_INIT_VEL_STD_Z = 0.2
+KF3_DEFAULT_DEPTH = 3.0          # started without any depth: placed here on the ray, very uncertain
+KF3_UNKNOWN_DEPTH_STD = 2.0
+KF3_PREDICT_MAX_SEC = 3.0        # not measured: the prediction keeps moving at most this long, ...
+KF3_PREDICT_MAX_STD_M = 1.5      # ... while its horizontal uncertainty stays below this, ...
+KF3_PREDICT_MAX_DIST_M = 3.0     # ... and at most this far from the last measured position; then FROZEN
+# FUTURE TRAJECTORY (the ONE prediction shared with nav2_bridge and drawn in the debug image): from
+# the last measurement, every KF_FUTURE_STEP_SEC, until the KF3_PREDICT_MAX_* limits. Straight if the
+# person was walking straight; along their ARC if they were turning (turn rate from the walking
+# direction at the last measurements), tighter and tighter if the turn rate was growing.
+TURN_MIN_SPEED = 0.3             # m/s: below this the walking direction is not reliable
+TURN_WINDOW_SEC = 0.8            # turn rate = change of walking direction over this window
+TURN_MIN_DEG_S = 10.0            # below this turn rate the person is walking straight
+CURVE_TREND_WINDOW_SEC = 1.5     # curve that TIGHTENS: trend of the turn rate over this window ...
+CURVE_MAX_TIGHTEN_DEG_S2 = 90.0  # ... at most this fast (deg/s per s) ...
+CURVE_MAX_RATE_DEG_S = 120.0     # ... up to this turn rate (a person turning a corner on the spot)
+CURVE_ARC_MAX_M = 1.5            # along the arc at most this far from the last seen position ...
+CURVE_MAX_TURN_DEG = 90.0        # ... and at most this much turn: then the trajectory ends there
+DEFAULT_INTRINSICS = (550.0, 550.0, 320.0, 240.0)   # fx, fy, cx, cy: only if the node gives no camera
+                                                     # (offline tests); the node uses the CameraInfo
+KF_ACCEL_PX = 40000.0            # "image" filter: white-noise acceleration, image (px^2/s^3) and depth (m^2/s^3)
 KF_ACCEL_DEPTH = 1.0
 KF_MEAS_STD_PX = 10.0            # measurement noise: box centre (px), ToF depth (m)
 KF_MEAS_STD_DEPTH = 0.15
@@ -161,8 +216,9 @@ GALLERY_CHAIN_FRAMES = 4         # ... or N clean continuous frames after an anc
 GALLERY_CHAIN_MIN_IOU = 0.5
 GALLERY_CHAIN_MAX_DEPTH_STEP_M = 0.3
 
-KF_TRAIL_LEN = 15                # target Kalman positions drawn as a trail in the debug image
-KF_FUTURE_SEC = 1.0              # debug image: where the Kalman expects the target in this many seconds
+KF_TRAIL_LEN = 15                # target filter positions drawn as a trail in the debug image
+KF_FUTURE_STEP_SEC = 1.0 / 3.0   # debug image: predicted points every this many seconds ...
+KF_FUTURE_STEPS = 9              # ... this many of them (9 x 0.33 s = 3 s ahead)
 
 CONFIRMED, KEPT, PENDING, MISSED = "confirmed", "kept", "pending", "missed"
 _REASONS = ("no_detections", "no_embedding", "no_depth", "low_similarity", "far_low_similarity",
@@ -200,11 +256,58 @@ def _touches(a, b):
 
 
 def class_group(name):
-    """Index of the CLASS_GROUPS group of a YOLOE class (an unknown class is a group of its own)."""
+    """Index of the CLASS_GROUPS group of a YOLOE class (a generic or unknown class: its own name)."""
     for i, group in enumerate(CLASS_GROUPS):
         if name in group:
             return i
     return name
+
+
+def class_compatible(name, group):
+    """A YOLOE class is compatible with the target group: same group, or a GENERIC robot label for a
+    robot target (quadruped or humanoid)."""
+    if class_group(name) == group:
+        return True
+    return name in GENERIC_ROBOT_CLASSES and group in (QUADRUPED_GROUP, HUMANOID_GROUP)
+
+
+def vote_class_group(score_dicts):
+    """Target group by MAJORITY over the SEARCH stability frames ([{class: score}] of the candidate).
+    Each frame votes with its BEST class (the label YOLOE gave it): person, quadruped, humanoid, or
+    generic "robot". 1) person against robot (a generic vote is a robot vote); 2) among robots,
+    quadruped against humanoid (generic votes do not count here; tie: higher total score).
+    Only generic votes: humanoid group, as before (when "robot" was in that group)."""
+    votes, total = {}, {}
+    for scores in score_dicts:
+        best = max(scores, key=scores.get)
+        g = "generic" if best in GENERIC_ROBOT_CLASSES else class_group(best)
+        votes[g] = votes.get(g, 0) + 1
+        total[g] = total.get(g, 0.0) + scores[best]
+    if not votes:
+        return None
+    robot = sum(n for g, n in votes.items() if g in (QUADRUPED_GROUP, HUMANOID_GROUP, "generic"))
+    others = {g: n for g, n in votes.items() if g not in (QUADRUPED_GROUP, HUMANOID_GROUP, "generic")}
+    if others:                                  # person (or an unknown class) against the robots
+        g_best = max(others, key=lambda g: (others[g], total[g]))
+        if others[g_best] > robot:
+            return g_best
+    q, h = votes.get(QUADRUPED_GROUP, 0), votes.get(HUMANOID_GROUP, 0)
+    if (q, total.get(QUADRUPED_GROUP, 0.0)) > (h, total.get(HUMANOID_GROUP, 0.0)):
+        return QUADRUPED_GROUP
+    return HUMANOID_GROUP
+
+
+def profile_for_group(group):
+    """Thresholds for this target group: the quadruped profile, or the standard values (read now,
+    so that a change of the module constants is seen)."""
+    std = dict(SEARCH_STABILITY_MIN_COS=SEARCH_STABILITY_MIN_COS, SEARCH_MAX_MISSED_FRAMES=0,
+               TARGET_HIGH=TARGET_HIGH, TARGET_LOW=TARGET_LOW, REACQ_THRESHOLD=REACQ_THRESHOLD,
+               REACQ_IMMEDIATE_SIM=REACQ_IMMEDIATE_SIM, GALLERY_VETO_MIN=GALLERY_VETO_MIN,
+               GALLERY_STRONG_ADD_MIN_SIM=GALLERY_STRONG_ADD_MIN_SIM, INTRUDER_RELEASE_SIM=INTRUDER_RELEASE_SIM,
+               TRACKING_GRACE_FRAMES=TRACKING_GRACE_FRAMES)
+    if QUADRUPED_PROFILE_ENABLED and group == QUADRUPED_GROUP:
+        return SimpleNamespace(name="quadrupede", **{**std, **QUADRUPED})
+    return SimpleNamespace(name="standard", **std)
 
 
 def _widen(box, frac):
@@ -296,6 +399,350 @@ class KalmanUVD:
     def pos_std(self):
         return math.sqrt(max(0.5 * (self.P[0, 0] + self.P[1, 1]), 0.0))
 
+    # --- same interface as KalmanOdom (the tracker and the overlay use only these) ---
+    def set_camera(self, cam):
+        pass                                   # image coordinates: the camera pose is not used
+
+    def stop(self):
+        self.x[3:6] = 0.0
+
+    def should_freeze(self, t):
+        return False                           # the tracker applies the HOLD_MAX_MISSES rule
+
+    def point(self):
+        return (float(self.x[0]), float(self.x[1]), float(self.x[2]))
+
+    @staticmethod
+    def project(p):
+        return (p[0], p[1])
+
+    def predicted_points(self, horizons):
+        """[(u, v, radius px)] where the target is expected after each horizon (s)."""
+        out = []
+        for h in horizons:
+            var = 0.5 * (self.P[0, 0] + self.P[1, 1]) + h * h * 0.5 * (self.P[3, 3] + self.P[4, 4]) \
+                + KF_ACCEL_PX * h ** 3 / 3.0
+            out.append((float(self.x[0] + self.x[3] * h), float(self.x[1] + self.x[4] * h),
+                        2.0 * math.sqrt(var)))
+        return out
+
+    def state(self):
+        return None                            # no position in odom
+
+    def trajectory(self):
+        return []                              # no shared trajectory with the image filter
+
+    curve = False
+
+
+# ======================================================================
+# Filter in odom: state (X, Y, Z, VX, VY, VZ), measurement (u, v, d) through the camera
+# ======================================================================
+@dataclass
+class Camera:
+    """Pinhole camera, optical frame (x right, y down, z forward), and its pose in odom at the time
+    of the image: p_odom = R @ p_cam + t. Without a pose (R = I, t = 0) odom = the camera frame."""
+    fx: float
+    fy: float
+    cx: float
+    cy: float
+    R: np.ndarray = field(default_factory=lambda: np.eye(3))
+    t: np.ndarray = field(default_factory=lambda: np.zeros(3))
+    posed: bool = False                        # True: R, t come from the TF (robot motion compensated)
+
+    MIN_Z = 0.2                                # closer / behind the camera: not projectable
+
+    def to_cam(self, p):
+        return self.R.T @ (np.asarray(p, dtype=float) - self.t)
+
+    def project(self, p):
+        """(u, v, depth) of an odom point, None if it is behind the camera."""
+        c = self.to_cam(p)
+        if c[2] < self.MIN_Z:
+            return None
+        return self.fx * c[0] / c[2] + self.cx, self.fy * c[1] / c[2] + self.cy, float(c[2])
+
+    def backproject(self, u, v, d):
+        c = np.array([(u - self.cx) * d / self.fx, (v - self.cy) * d / self.fy, d], dtype=float)
+        return self.R @ c + self.t
+
+    def jac_back(self, u, v, d):
+        """d(odom point) / d(u, v, d)."""
+        J = np.array([[d / self.fx, 0.0, (u - self.cx) / self.fx],
+                      [0.0, d / self.fy, (v - self.cy) / self.fy],
+                      [0.0, 0.0, 1.0]])
+        return self.R @ J
+
+    def jac_proj(self, p):
+        """d(u, v, d) / d(odom point) (3x3)."""
+        c = self.to_cam(p)
+        z = max(c[2], self.MIN_Z)
+        J = np.array([[self.fx / z, 0.0, -self.fx * c[0] / z ** 2],
+                      [0.0, self.fy / z, -self.fy * c[1] / z ** 2],
+                      [0.0, 0.0, 1.0]])
+        return J @ self.R.T
+
+
+def default_camera():
+    return Camera(*DEFAULT_INTRINSICS)
+
+
+class TurnEstimator:
+    """Walking direction, turn rate and its trend (tightening curve), from the filter velocity at
+    every measurement."""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self._hist, self._rates = [], []
+        self.heading, self.rate, self.accel = None, 0.0, 0.0
+
+    def add(self, t, vx, vy):
+        if math.hypot(vx, vy) < TURN_MIN_SPEED:
+            return
+        h = math.atan2(vy, vx)
+        self.heading = h
+        self._hist = [(ti, a) for ti, a in self._hist if t - ti <= TURN_WINDOW_SEC] + [(t, h)]
+        t0, h0 = self._hist[0]
+        if t - t0 > 1e-3:
+            self.rate = math.atan2(math.sin(h - h0), math.cos(h - h0)) / (t - t0)
+            self._rates.append((t, self.rate))
+        self._rates = [(ti, w) for ti, w in self._rates if t - ti <= CURVE_TREND_WINDOW_SEC]
+        self.accel = 0.0
+        if len(self._rates) >= 3:
+            ts, ws = [ti for ti, _ in self._rates], [w for _, w in self._rates]
+            tm, wm = sum(ts) / len(ts), sum(ws) / len(ws)
+            den = sum((ti - tm) ** 2 for ti in ts)
+            a = sum((ti - tm) * (w - wm) for ti, w in zip(ts, ws)) / den if den > 1e-9 else 0.0
+            if a * self.rate > 0.0:          # only a TIGHTENING curve is extrapolated
+                self.accel = math.copysign(min(abs(a), math.radians(CURVE_MAX_TIGHTEN_DEG_S2)), a)
+
+    @property
+    def turning(self):
+        return self.heading is not None and abs(self.rate) >= math.radians(TURN_MIN_DEG_S)
+
+
+class KalmanOdom:
+    """Target position and velocity in odom, constant velocity (white-noise acceleration).
+    Measurement = box centre (u, v) and depth d, i.e. the odom point seen through the camera at the
+    time of the image (extended Kalman filter): the robot motion is compensated by the camera pose.
+    Without depth only (u, v) update the filter. Same interface as KalmanUVD for the tracker."""
+
+    def __init__(self, u, v, d, t, cam, depth_hint=None):
+        self.cam = cam or default_camera()
+        self.depth_known = d is not None
+        self.turn = TurnEstimator()
+        self._place(u, v, d if d is not None else (depth_hint or KF3_DEFAULT_DEPTH), d is not None)
+        self.t = self.t_update = self.t_meas = t
+        self.frozen = False
+        self._snapshot()
+
+    def _place(self, u, v, d, depth_known):
+        """Position on the ray of (u, v) at depth d, velocity unknown."""
+        J = self.cam.jac_back(u, v, d)
+        sd = KF_MEAS_STD_DEPTH if depth_known else KF3_UNKNOWN_DEPTH_STD
+        Rm = np.diag([KF_MEAS_STD_PX ** 2, KF3_MEAS_STD_V_PX ** 2, sd ** 2])
+        self.x = np.concatenate([self.cam.backproject(u, v, d), np.zeros(3)])
+        self.P = np.zeros((6, 6))
+        self.P[:3, :3] = J @ Rm @ J.T
+        self.P[3:, 3:] = np.diag([KF3_INIT_VEL_STD_XY ** 2, KF3_INIT_VEL_STD_XY ** 2, KF3_INIT_VEL_STD_Z ** 2])
+        self.p_meas = self.x[:3].copy()        # position at the last measurement (freeze distance)
+
+    def set_camera(self, cam):
+        if cam is not None:
+            self.cam = cam
+
+    @staticmethod
+    def _FQ(dt):
+        F = np.eye(6)
+        F[0, 3] = F[1, 4] = F[2, 5] = dt
+        Q = np.zeros((6, 6))
+        for i, q in enumerate((KF3_ACCEL_XY, KF3_ACCEL_XY, KF3_ACCEL_Z)):
+            Q[i, i] = q * dt ** 3 / 3.0
+            Q[i, i + 3] = Q[i + 3, i] = q * dt ** 2 / 2.0
+            Q[i + 3, i + 3] = q * dt
+        return F, Q
+
+    def predict_to(self, t):
+        dt = t - self.t
+        if dt <= 0.0:
+            return
+        F, Q = self._FQ(dt)
+        self.x = F @ self.x
+        self.P = F @ self.P @ F.T + Q
+        self.t = t
+
+    def _H_R(self, with_depth):
+        n = 3 if with_depth else 2
+        H = np.zeros((n, 6))
+        H[:, :3] = self.cam.jac_proj(self.x[:3])[:n]
+        R = np.diag([KF_MEAS_STD_PX ** 2, KF3_MEAS_STD_V_PX ** 2, KF_MEAS_STD_DEPTH ** 2][:n])
+        return H, R
+
+    def mahalanobis2(self, u, v, d=None, P=None):
+        dof = 2 if d is None else 3
+        pr = self.cam.project(self.x[:3])
+        if pr is None:
+            return float("inf"), dof
+        H, R = self._H_R(d is not None)
+        y = np.array([u, v] if d is None else [u, v, d], dtype=float) - np.array(pr[:dof])
+        S = H @ (self.P if P is None else P) @ H.T + R
+        return float(y @ np.linalg.solve(S, y)), dof
+
+    def update(self, u, v, d, t):
+        pr = self.cam.project(self.x[:3])
+        if pr is None or (d is not None and not self.depth_known):
+            vel, Pv = self.x[3:].copy(), self.P[3:, 3:].copy()   # first depth ever (or the prediction is
+            self._place(u, v, d if d is not None else (pr[2] if pr else KF3_DEFAULT_DEPTH), d is not None)
+            if pr is not None:                                 # behind the camera): restart the position
+                self.x[3:], self.P[3:, 3:] = vel, Pv
+            self.depth_known = self.depth_known or d is not None
+        else:
+            H, R = self._H_R(d is not None)
+            n = H.shape[0]
+            y = np.array([u, v, d][:n], dtype=float) - np.array(pr[:n])
+            S = H @ self.P @ H.T + R
+            K = self.P @ H.T @ np.linalg.inv(S)
+            self.x = self.x + K @ y
+            I_KH = np.eye(6) - K @ H
+            self.P = I_KH @ self.P @ I_KH.T + K @ R @ K.T            # Joseph form
+        self.p_meas = self.x[:3].copy()
+        self.t = self.t_update = self.t_meas = t
+        self.frozen = False
+        self.turn.add(t, self.x[3], self.x[4])
+        self._snapshot()
+
+    def reset_depth(self, d):
+        """The filter depth is wrong (see DEPTH_RESYNC_*): move the point along the current ray to d."""
+        u, v = self.center
+        self._place(u, v, d, True)
+        self.depth_known = True
+        self.turn.reset()
+        self.t_meas = self.t
+        self._snapshot()
+
+    def stop(self):
+        """Prediction frozen at the END of the future trajectory (the same point for the tracker,
+        the overlay and nav2_bridge): no more extrapolation."""
+        self.x[:3] = self._traj[-1][1:]
+        self.x[3:] = 0.0
+        self.frozen = True
+
+    def should_freeze(self, t):
+        """Not measured beyond the end of the future trajectory (KF3_PREDICT_MAX_*, curve limits)."""
+        return not self.frozen and t - self.t_meas > self._traj[-1][0] + 1e-6
+
+    # --- future trajectory ---------------------------------------------------------------------
+    def _snapshot(self):
+        """At every measurement: the trajectory from here (kept until the next measurement)."""
+        self.x_meas, self.P_meas = self.x.copy(), self.P.copy()
+        self._traj = self._trajectory()
+
+    def _trajectory(self):
+        """[(h, X, Y, Z)]: where the target is expected h seconds after the last measurement, every
+        KF_FUTURE_STEP_SEC. Ends when the horizontal uncertainty exceeds KF3_PREDICT_MAX_STD_M, after
+        KF3_PREDICT_MAX_SEC, beyond KF3_PREDICT_MAX_DIST_M, or at the end of the curve (CURVE_*)."""
+        x0, P0 = self.x_meas, self.P_meas
+        p0 = x0[:3]
+        pts = [(0.0, float(p0[0]), float(p0[1]), float(p0[2]))]
+        speed = math.hypot(x0[3], x0[4])
+        curve = self.turn.turning and speed >= TURN_MIN_SPEED
+        heading, w_max = math.atan2(x0[4], x0[3]), math.radians(CURVE_MAX_RATE_DEG_S)
+        pos, s_done, turned, t_arc = p0.copy(), 0.0, 0.0, 0.0
+        step = KF_FUTURE_STEP_SEC
+        for k in range(1, int(round(KF3_PREDICT_MAX_SEC / step)) + 1):
+            h = k * step
+            F, Q = self._FQ(h)
+            P = F @ P0 @ F.T + Q
+            if math.sqrt(max(0.5 * (P[0, 0] + P[1, 1]), 0.0)) > KF3_PREDICT_MAX_STD_M:
+                break
+            if curve:
+                ds, end = step / 10.0, False
+                for _ in range(10):
+                    w = max(-w_max, min(w_max, self.turn.rate + self.turn.accel * t_arc))
+                    heading += w * ds
+                    turned += w * ds
+                    pos = pos + speed * ds * np.array([math.cos(heading), math.sin(heading), 0.0])
+                    s_done += speed * ds
+                    t_arc += ds
+                    if s_done >= CURVE_ARC_MAX_M or abs(turned) >= math.radians(CURVE_MAX_TURN_DEG):
+                        end = True
+                        break
+                pts.append((h, float(pos[0]), float(pos[1]), float(pos[2])))
+                if end:
+                    break
+            else:
+                pos = p0 + x0[3:] * h
+                if math.hypot(pos[0] - p0[0], pos[1] - p0[1]) > KF3_PREDICT_MAX_DIST_M:
+                    break
+                pts.append((h, float(pos[0]), float(pos[1]), float(pos[2])))
+        return pts
+
+    def trajectory(self):
+        """[(t, X, Y, Z)] with absolute times (same clock as the tracker)."""
+        return [(self.t_meas + h, x, y, z) for h, x, y, z in self._traj]
+
+    @property
+    def curve(self):
+        return self.turn.turning
+
+    @property
+    def horizontal_std(self):
+        return math.sqrt(max(0.5 * (self.P[0, 0] + self.P[1, 1]), 0.0))
+
+    @property
+    def center(self):
+        pr = self.cam.project(self.x[:3])
+        return (-1e6, -1e6) if pr is None else (float(pr[0]), float(pr[1]))
+
+    @property
+    def depth(self):
+        pr = self.cam.project(self.x[:3])
+        return None if pr is None or not self.depth_known else float(pr[2])
+
+    @property
+    def pos_std(self):
+        """Uncertainty of the prediction in the image (px)."""
+        if self.cam.project(self.x[:3]) is None:
+            return 1e6
+        J = self.cam.jac_proj(self.x[:3])[:2]
+        C = J @ self.P[:3, :3] @ J.T
+        return math.sqrt(max(0.5 * (C[0, 0] + C[1, 1]), 0.0))
+
+    def point(self):
+        return self.x[:3].copy()
+
+    def project(self, p):
+        pr = self.cam.project(p)
+        return None if pr is None else (pr[0], pr[1])
+
+    def predicted_points(self, horizons):
+        """[(u, v, radius px)]: where the target is expected after each horizon (s), seen from the
+        CURRENT camera pose, with a radius of 2 std of the predicted position."""
+        out = []
+        for h in horizons:
+            F, Q = self._FQ(h)
+            x, P = F @ self.x, F @ self.P @ F.T + Q
+            pr = self.cam.project(x[:3])
+            if pr is None:
+                continue
+            J = self.cam.jac_proj(x[:3])[:2]
+            C = J @ P[:3, :3] @ J.T
+            out.append((float(pr[0]), float(pr[1]), 2.0 * math.sqrt(max(0.5 * (C[0, 0] + C[1, 1]), 0.0))))
+        return out
+
+    def state(self):
+        """(position, velocity, 6x6 covariance) in odom."""
+        return self.x[:3].copy(), self.x[3:].copy(), self.P.copy()
+
+
+def make_filter(u, v, d, t, cam=None, depth_hint=None):
+    """The predictive filter chosen with PREDICTIVE_FILTER."""
+    if PREDICTIVE_FILTER == "odom":
+        return KalmanOdom(u, v, d, t, cam, depth_hint)
+    return KalmanUVD(u, v, d, t)
+
 
 # ======================================================================
 # Multi-view gallery of the target (long-term memory)
@@ -351,7 +798,8 @@ class Gallery:
         if not self.views or not clean or embedding is None or dist is None:
             self.chain_reset()
             return None
-        if sim_gallery >= GALLERY_STRONG_ADD_MIN_SIM:      # sure from the long-term memory itself
+        strong = GALLERY_STRONG_ADD_MIN_SIM if getattr(self, "strong_add_min", None) is None else self.strong_add_min
+        if sim_gallery >= strong:                          # sure from the long-term memory itself
             self._anchored, self._chain = True, 0
             return "strong" if self.try_add(embedding, thumb) else None
         continuous = (prev_box is not None and prev_dist is not None
@@ -404,15 +852,15 @@ class Person:
     box: tuple
     dist: Optional[float]
     embedding: Optional[np.ndarray]
-    kf: KalmanUVD
+    kf: object                            # KalmanOdom or KalmanUVD (PREDICTIVE_FILTER)
     misses: int = 0
     gate_P: Optional[np.ndarray] = None   # covariance of the gate at the last MEASUREMENT (frozen gate)
     unmeasured: int = 0                   # calls since the Kalman was last updated with a measurement
                                           # (a miss OR an occluded frame: seen, but nothing measured)
 
     @classmethod
-    def from_detection(cls, d, t):
-        return cls(d.box, d.dist, d.embedding, KalmanUVD(d.center[0], d.center[1], d.dist, t))
+    def from_detection(cls, d, t, cam=None):
+        return cls(d.box, d.dist, d.embedding, make_filter(d.center[0], d.center[1], d.dist, t, cam))
 
     def follow(self, d, t, learn=True, use_depth=True):
         dist = d.dist if use_depth else None
@@ -474,19 +922,44 @@ class TargetTracker:
         self.others = []                 # people of the PREVIOUS call (rewritten every call)
         self.gallery = Gallery()
         self.last_kf = None              # Kalman row of the last call (published on KF_TOPIC)
+        self.target_group = None
+        self.p = profile_for_group(None) # thresholds of the target's profile (set at the lock)
+        if not hasattr(self, "cam"):
+            self.cam = default_camera()  # replaced by the node's camera (intrinsics + pose) at every call
         self._at_prediction = []         # (A) depths of the people at the predicted point (prev. call)
         self._prev_other_boxes = []      # (A) (box, depth) of the previous call that were not the target
-        self.trail = deque(maxlen=KF_TRAIL_LEN)   # (u, v, seen) of the target Kalman, last calls
+        self.trail = deque(maxlen=KF_TRAIL_LEN)   # (filter point, seen, ...) of the target, last calls
         self._discarded_depths = []
         self._reset_pending()
 
-    def lock(self, target_det, other_dets, t):
-        """SEARCH: the chosen detection = TARGET, the other detections = people of this call."""
+    def lock(self, target_det, other_dets, t, cam=None, group=None):
+        """SEARCH: the chosen detection = TARGET, the other detections = people of this call.
+        cam: Camera with the pose of the camera in odom at the time of the image (None: unknown).
+        group: class group voted over the SEARCH frames (None: from this detection)."""
         self.reset()
-        self.target = Person.from_detection(target_det, t)
-        self.target_group = class_group(target_det.class_name)
+        if cam is not None:
+            self.cam = cam
+        self.target = Person.from_detection(target_det, t, self.cam)
+        if group is None:
+            group = vote_class_group([target_det.class_scores or {target_det.class_name: target_det.score}])
+        self.target_group = group
+        self.p = profile_for_group(group)
+        self.gallery.strong_add_min = self.p.GALLERY_STRONG_ADD_MIN_SIM
         self.gallery.reset(target_det.embedding, target_det.box, target_det.dist, target_det.thumb)
         self.others = [Other(d.box, d.embedding) for d in other_dets if d.embedding is not None]
+
+    def switch_to_posed_camera(self, cam, t):
+        """The TF became available only after the lock: the filter restarts in odom from its current
+        estimate (seen from the same image coordinates), so the robot motion is compensated from now on."""
+        self.cam = cam
+        tgt = self.target
+        if tgt is None or PREDICTIVE_FILTER != "odom":
+            return
+        (u, v), d = tgt.kf.center, tgt.kf.depth
+        if abs(u) > 1e5:
+            return
+        tgt.kf = make_filter(u, v, d, t, cam, depth_hint=tgt.dist)
+        tgt.gate_P = tgt.kf.P.copy()
 
     def enter_recovery(self):
         self._reset_pending()
@@ -498,13 +971,20 @@ class TargetTracker:
         return self.target.kf.center, self.target.kf.pos_std
 
     # ------------------------------------------------------------------
-    def step(self, dets, t, recovery=False):
+    def step(self, dets, t, recovery=False, cam=None):
         t0 = time.perf_counter()
         tgt = self.target
-        if tgt.unmeasured > HOLD_MAX_MISSES:
-            tgt.kf.x[3:6] = 0.0      # not measured for a while (lost, or occluded): the last known
-                                     # position, no more extrapolation
-        tgt.kf.predict_to(t)
+        if cam is not None:
+            self.cam = cam                     # camera pose of THIS image (None: keep the last one)
+        tgt.kf.set_camera(self.cam)
+        if PREDICTIVE_FILTER == "odom":
+            tgt.kf.predict_to(t)               # not measured: the prediction keeps moving while it is
+            if tgt.kf.should_freeze(t):        # reliable (KF3_PREDICT_MAX_*), then it stops there
+                tgt.kf.stop()
+        else:
+            if tgt.unmeasured > HOLD_MAX_MISSES:
+                tgt.kf.stop()                  # not measured for a while (lost, or occluded): the last
+            tgt.kf.predict_to(t)               # known position, no more extrapolation
         # (A) who else was at the predicted point in the previous call (their depths)
         self._at_prediction = self._someone_at_prediction() if NEAR_BONUS_ONLY_WHEN_ALONE else []
         if self._at_prediction and not recovery:
@@ -567,7 +1047,7 @@ class TargetTracker:
             if d.embedding is None:
                 d.note = "no_embedding"
                 continue
-            if GALLERY_VETO_MIN is not None and d.sim_gal < GALLERY_VETO_MIN:
+            if self.p.GALLERY_VETO_MIN is not None and d.sim_gal < self.p.GALLERY_VETO_MIN:
                 d.note = "gallery_veto"
                 continue
             if d.best_other is not None and d.best_other >= d.sim_target:
@@ -589,7 +1069,7 @@ class TargetTracker:
                 if REACQ_REQUIRE_DEPTH and d.dist is None:
                     d.note = "no_depth"
                     continue
-                if d.sim_target < REACQ_THRESHOLD:
+                if d.sim_target < self.p.REACQ_THRESHOLD:
                     d.note = "far_low_similarity" if continuity else "low_similarity"
                     continue
                 if not self._reacq_distance_ok(d):
@@ -597,7 +1077,7 @@ class TargetTracker:
                     continue
             else:
                 d.near_bonus = self._near_bonus_ok(d)
-                if d.sim_target < (TARGET_LOW if d.near_bonus else REACQ_THRESHOLD):
+                if d.sim_target < (self.p.TARGET_LOW if d.near_bonus else self.p.REACQ_THRESHOLD):
                     d.note = "low_similarity"
                     continue
             out[j] = near
@@ -628,7 +1108,7 @@ class TargetTracker:
         gallery recognises it clearly (>= INTRUDER_RELEASE_SIM)."""
         if not INTRUDER_STICKY or not self.others or self.target is None:
             return False
-        if d.sim_gal >= INTRUDER_RELEASE_SIM:
+        if d.sim_gal >= self.p.INTRUDER_RELEASE_SIM:
             return False
         c_other = min(self._box_cost(d.box, o.box) for o in self.others)
         c_target = self._box_cost(d.box, self._target_ref_box())
@@ -639,8 +1119,8 @@ class TargetTracker:
         if getattr(self, "target_group", None) is None:
             return True
         scores = d.class_scores or {d.class_name: d.score}
-        mine = max((s for c, s in scores.items() if class_group(c) == self.target_group), default=0.0)
-        others = max((s for c, s in scores.items() if class_group(c) != self.target_group), default=0.0)
+        mine = max((s for c, s in scores.items() if class_compatible(c, self.target_group)), default=0.0)
+        others = max((s for c, s in scores.items() if not class_compatible(c, self.target_group)), default=0.0)
         return mine > 0.0 and mine >= others
 
     def _reacq_distance_ok(self, d):
@@ -736,9 +1216,9 @@ class TargetTracker:
         d, near = dets[j_t], cands[j_t]
         res.det = d
         if near:
-            res.status = CONFIRMED if d.sim_target >= TARGET_HIGH else KEPT
+            res.status = CONFIRMED if d.sim_target >= self.p.TARGET_HIGH else KEPT
             self._reset_pending()
-        elif d.sim_target >= REACQ_IMMEDIATE_SIM or self._confirm_pending(d.box):
+        elif d.sim_target >= self.p.REACQ_IMMEDIATE_SIM or self._confirm_pending(d.box):
             res.status, res.jump = CONFIRMED, True
             self._reset_pending()
         else:
@@ -754,7 +1234,8 @@ class TargetTracker:
             return
         d = res.det
         if res.jump:                          # somewhere else than predicted: the old motion is meaningless
-            tgt.kf = KalmanUVD(d.center[0], d.center[1], tgt.kf.depth if d.depth_occluded else d.dist, t)
+            tgt.kf = make_filter(d.center[0], d.center[1], tgt.kf.depth if d.depth_occluded else d.dist, t,
+                                 self.cam, depth_hint=tgt.kf.depth)
             tgt.gate_P = tgt.kf.P.copy()
             self._discarded_depths = []
         if d.depth_occluded and not self._depth_resync(res, d, dets):
@@ -847,7 +1328,7 @@ class TargetTracker:
                 # that person than to the target STAYS (an intruder covering the target: mixed
                 # crop, its similarity to the target can be high)
                 stays = d.best_other is not None and d.best_other >= d.sim_target
-                other = d.sim_target < TARGET_LOW - AMBIGUITY_MARGIN or self._continues_other(d) or stays
+                other = d.sim_target < self.p.TARGET_LOW - AMBIGUITY_MARGIN or self._continues_other(d) or stays
             if other:
                 new.append(Other(d.box, d.embedding))
         self.others = new
@@ -884,8 +1365,9 @@ class TargetTracker:
         """Target Kalman estimate of this call: published on KF_TOPIC and drawn as the trail."""
         kf = self.target.kf
         d = res.det if res.seen else None
-        self.last_kf = {"post_u": float(kf.x[0]), "post_v": float(kf.x[1]), "post_d": float(kf.x[2])}
-        self.trail.append((float(kf.x[0]), float(kf.x[1]), res.seen, float(kf.x[2]),
+        (u, v), kd = kf.center, kf.depth
+        self.last_kf = {"post_u": float(u), "post_v": float(v), "post_d": float(kd) if kd is not None else 0.0}
+        self.trail.append((kf.point(), res.seen, kd,
                            None if d is None or d.dist is None else float(d.dist), res.occluded))
 
     # re-acquisition confirmation ------------------------------------------

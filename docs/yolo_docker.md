@@ -8,8 +8,7 @@ docker build -t spot-yolo . -f yolo.dockerfile
 
 **Run**
 ```bash
-<xhost +local:root
-
+xhost +local:root
 docker run -it --rm \
   --name yolo-container \
   --runtime=nvidia \
@@ -23,5 +22,5 @@ docker run -it --rm \
   -e NVIDIA_DRIVER_CAPABILITIES=all \
   -v /tmp/.X11-unix:/tmp/.X11-unix:rw \
   -v /home/mivia/Desktop/SPOT/Spot-Spark/src/trackerApp:/home/yolo_ws/src \
-  spot-yolo>
+  spot-yolo
 ```

@@ -48,8 +48,12 @@ ros2 topic pub --once /arm_controller/joint_trajectory trajectory_msgs/msg/Joint
 
 
 
-  W_COSINE = 0.3                   # ReID similarity = weighted mean of cosine, Euclidean and magnitude terms
-W_EUCLIDEAN = 0.7
+  # ======================================================================
+# PARAMETERS — the similarities are on the scale of the weighted ReID similarity: when the weights
+# change, recalibrate them from "sim_stats" in the metrics JSON (target / other people distributions).
+# ======================================================================
+W_COSINE = 0.9                   # ReID similarity = weighted mean of cosine, Euclidean and magnitude terms
+W_EUCLIDEAN = 0.1
 W_MAGNITUDE = 0.0
 EUCLIDEAN_SCALE = 10.0
 MAGNITUDE_SCALE = 10.0
@@ -68,10 +72,10 @@ SEARCH_STABILITY_MIN_COS = 0.60  # SEARCH: plain cosine between consecutive fram
 # pose seconds later vs the gallery 0.52-0.60; side 0.47-0.69; back / behind the jacket 0.39-0.50;
 # Pepper (not a person) 0.31-0.36; ANOTHER PERSON: not measured yet -> recalibrate with
 # "sim_stats" of the metrics JSON of a session with a second person.
-TARGET_HIGH = 0.60               # target CONFIRMED
-TARGET_LOW = 0.45                # target KEPT (uncertain) between LOW and HIGH
-GALLERY_VETO_MIN = 0.43          # never the target below this similarity to the gallery (None = off)
-FF_MAX_LEAD = 0.15               # sim_target = max(gallery, min(last embedding, gallery + this)): the short-term
+TARGET_HIGH = 0.77               # target CONFIRMED
+TARGET_LOW = 0.64                # target KEPT (uncertain) between LOW and HIGH
+GALLERY_VETO_MIN = 0.62# never the target below this similarity to the gallery (None = off)
+FF_MAX_LEAD = 0.20               # sim_target = max(gallery, min(last embedding, gallery + this)): the short-term
                                  # memory can lift a detection only this much above the long-term one. If an
                                  # impostor was followed for a while, the last embedding IS the impostor: without
                                  # this cap it would always beat the real target (seen on the robot, 13/10)
@@ -85,7 +89,7 @@ OTHER_CONTINUITY_MAX = 1.0       # a detection CONTINUES a person of the previou
                                  # this) and not clearly more similar to the target: while it walks over the target
                                  # its crop is mixed (part of the target inside) and the appearance alone is fooled
 GALLERY_TIEBREAK = 0.06         # tie on sim_target: the one clearly more similar to the GALLERY wins, then the position
-AMBIGUITY_MARGIN = 0.05          # appearance decides; two candidates closer than this in sim_target are a tie:
+AMBIGUITY_MARGIN = 0.1          # appearance decides; two candidates closer than this in sim_target are a tie:
                                  # the one near the Kalman prediction wins, otherwise nobody is taken
 CLEAN_MARGIN = 0.5               # clean frame: no other box touches the target box widened by this (x width)
 
@@ -94,8 +98,10 @@ CLEAN_MARGIN = 0.5               # clean frame: no other box touches the target 
 # only if nobody else could be at the predicted point. If in the previous call another person touched
 # the target's box at the prediction (widened by CLEAN_MARGIN: beside it, covering it), whoever is
 # found there now may be that person (photos IMG_0347/0348, 14/10: the occluder taken as KEPT at
-# 0.46) -> everybody needs REACQ_THRESHOLD and a tie is "ambiguous". Nobody around (turning around,
-# a detector flicker): the bonus stays.
+# 0.46) -> no bonus (REACQ_THRESHOLD, a tie is "ambiguous") UNLESS the DEPTH tells them apart: the
+# detection is at the target's predicted depth (within OCCLUSION_DEPTH_JUMP_M) and closer to it than
+# to the depth of every person who was there (video 14/10 11:07: the target at 3.4 m, sim 0.49, lost
+# because a person 1.9 m away walked in front of it). Nobody around: the bonus stays.
 NEAR_BONUS_ONLY_WHEN_ALONE = True
 # (B) STICKY INTRUDERS. A person of the previous call who continues there (box closer to theirs than
 # to the target's by INTRUDER_STICKY_MARGIN, see _box_cost) STAYS an intruder: never a candidate, and
@@ -124,8 +130,8 @@ OCCLUSION_MAX_SIZE_RATIO = 1.15  # box height vs expected height at the predicte
 DEPTH_RESYNC_FRAMES = 3
 DEPTH_RESYNC_MAX_SPREAD_M = 0.3
 
-REACQ_THRESHOLD = 0.50           # re-acquisition (was 0.60: you, frontal in RECOVERY, stayed at 0.52-0.58)
-REACQ_IMMEDIATE_SIM = 0.58       # between REACQ_THRESHOLD and this: REACQ_CONFIRM_FRAMES calls in the same place
+REACQ_THRESHOLD = 0.75           # re-acquisition (was 0.60: you, frontal in RECOVERY, stayed at 0.52-0.58)
+REACQ_IMMEDIATE_SIM = 71.       # between REACQ_THRESHOLD and this: REACQ_CONFIRM_FRAMES calls in the same place
 REACQ_CONFIRM_FRAMES = 2
 REACQ_PX_TOLERANCE = 60.0
 REACQ_MAX_GAP = 2
